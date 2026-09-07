@@ -41,6 +41,14 @@ var CLIENTS = [
     userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.master.0"
   }
 ];
+function proxied(targetUrl, env) {
+  const base = (env.YT_PROXY_URL ?? "").trim();
+  if (!base) return targetUrl;
+  if (base.includes("{url}")) return base.replace("{url}", encodeURIComponent(targetUrl));
+  const u = new URL(targetUrl);
+  return base.replace(/\/$/, "") + u.pathname + u.search;
+}
+__name(proxied, "proxied");
 var INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 var PLAYER_URL = "https://www.youtube.com/youtubei/v1/player?key=" + INNERTUBE_KEY + "&prettyPrint=false";
 var ExtractionError = class extends Error {
@@ -100,7 +108,7 @@ async function callPlayer(client, videoId, env) {
       contentPlaybackContext: { html5Preference: "HTML5_PREF_WANTS" }
     }
   });
-  const target = env.YT_PROXY_URL ? `${env.YT_PROXY_URL.replace(/\/$/, "")}/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false` : PLAYER_URL;
+  const target = proxied(PLAYER_URL, env);
   const res = await fetch(target, {
     method: "POST",
     headers: {
@@ -153,7 +161,7 @@ async function fetchPlayer(videoId, env) {
   const joined = failures.join(" | ");
   if (/sign in|bot|confirm you/i.test(joined)) {
     throw new ExtractionError(
-      "YouTube demanded a bot check for this request.",
+      "YouTube is blocking this server for this video. It checks whether requests come from a real device, and rejects most traffic from cloud hosting like Cloudflare. Other videos may still work.",
       429,
       joined
     );
@@ -422,9 +430,11 @@ function toFeedItem(r) {
 }
 __name(toFeedItem, "toFeedItem");
 async function innertube(endpoint, payload, env) {
-  const base = env.YT_PROXY_URL ? env.YT_PROXY_URL.replace(/\/$/, "") : "https://www.youtube.com";
   const res = await fetch(
-    `${base}/youtubei/v1/${endpoint}?key=${INNERTUBE_KEY2}&prettyPrint=false`,
+    proxied(
+      `https://www.youtube.com/youtubei/v1/${endpoint}?key=${INNERTUBE_KEY2}&prettyPrint=false`,
+      env
+    ),
     {
       method: "POST",
       headers: {

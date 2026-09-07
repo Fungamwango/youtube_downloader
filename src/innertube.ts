@@ -77,6 +77,24 @@ export const CLIENTS: ClientProfile[] = [
   },
 ];
 
+/**
+ * Routes an InnerTube URL through YT_PROXY_URL when one is configured.
+ *
+ * Workers' fetch() cannot use a classic CONNECT proxy, so two shapes that it
+ * *can* use are supported:
+ *   - a template containing {url}, for scraping APIs that take the target as a
+ *     query parameter, e.g. https://api.example.com/get?token=X&url={url}
+ *   - a reverse-proxy origin that mirrors youtube.com's paths, e.g.
+ *     https://yt.example.com  ->  https://yt.example.com/youtubei/v1/player?...
+ */
+export function proxied(targetUrl: string, env: { YT_PROXY_URL?: string }): string {
+  const base = (env.YT_PROXY_URL ?? "").trim();
+  if (!base) return targetUrl;
+  if (base.includes("{url}")) return base.replace("{url}", encodeURIComponent(targetUrl));
+  const u = new URL(targetUrl);
+  return base.replace(/\/$/, "") + u.pathname + u.search;
+}
+
 const INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const PLAYER_URL =
   "https://www.youtube.com/youtubei/v1/player?key=" +
@@ -193,9 +211,7 @@ async function callPlayer(
     },
   });
 
-  const target = env.YT_PROXY_URL
-    ? `${env.YT_PROXY_URL.replace(/\/$/, "")}/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`
-    : PLAYER_URL;
+  const target = proxied(PLAYER_URL, env);
 
   const res = await fetch(target, {
     method: "POST",
@@ -268,7 +284,9 @@ export async function fetchPlayer(
   const joined = failures.join(" | ");
   if (/sign in|bot|confirm you/i.test(joined)) {
     throw new ExtractionError(
-      "YouTube demanded a bot check for this request.",
+      "YouTube is blocking this server for this video. It checks whether " +
+        "requests come from a real device, and rejects most traffic from " +
+        "cloud hosting like Cloudflare. Other videos may still work.",
       429,
       joined,
     );

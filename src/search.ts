@@ -6,6 +6,8 @@
  * WEB context is fine and returns the richest result cards.
  */
 
+import { proxied } from "./innertube";
+
 const INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const WEB_CLIENT = {
   clientName: "WEB",
@@ -124,11 +126,11 @@ async function innertube(
   payload: Record<string, unknown>,
   env: { YT_PROXY_URL?: string },
 ): Promise<unknown> {
-  const base = env.YT_PROXY_URL
-    ? env.YT_PROXY_URL.replace(/\/$/, "")
-    : "https://www.youtube.com";
   const res = await fetch(
-    `${base}/youtubei/v1/${endpoint}?key=${INNERTUBE_KEY}&prettyPrint=false`,
+    proxied(
+      `https://www.youtube.com/youtubei/v1/${endpoint}?key=${INNERTUBE_KEY}&prettyPrint=false`,
+      env,
+    ),
     {
       method: "POST",
       headers: {

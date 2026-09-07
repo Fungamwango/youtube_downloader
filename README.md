@@ -130,11 +130,44 @@ npm run deploy
 
 ## Known limitations
 
+### Extraction is IP-blocked from Cloudflare (the big one)
+
+YouTube rejects most InnerTube player requests coming from cloud hosting with
+`LOGIN_REQUIRED` — "Sign in to confirm you're not a bot". Measured on the
+deployed Worker, roughly **1 video in 6** succeeds. The same requests from a
+residential IP succeed for every video tested.
+
+This is not a bug that can be coded around, and it was verified rather than
+assumed:
+
+- **It is deterministic, not flaky.** Six videos × three attempts: five failed
+  all three times, one succeeded all three. Retrying does not help.
+- **It is not the client choice.** A matrix of 11 client contexts was tested.
+  From a residential IP, `IOS` returns direct URLs for every video; `ANDROID_VR`
+  for one in four; `ANDROID`, both music clients, `WEB_CREATOR`, `MWEB` and both
+  embedded-player clients fail outright. The client order in `innertube.ts`
+  reflects those measurements. From Cloudflare, even `IOS` is mostly refused.
+- **`visitorData` does not help.** Minting a visitor token and attaching it to
+  the context changed nothing.
+- **Browser-side extraction is impossible.** YouTube's InnerTube endpoints
+  answer cross-origin preflights with `403` and send no `Access-Control-*`
+  headers, so the page cannot call them directly from the visitor's own IP.
+
+**The fix is to make extraction leave from a non-datacenter IP**, via
+`YT_PROXY_URL` (see Config). Two shapes are supported: a `{url}` template for
+scraping APIs, or a reverse-proxy origin — for example a small service on a home
+connection or VPS that mirrors `youtube.com` paths. Workers' `fetch()` cannot
+use a classic CONNECT proxy, so a plain `host:port` proxy string will not work.
+
+Note that search, browse, the whole UI and the download/merge pipeline are all
+unaffected — only the player-metadata call is blocked.
+
+### Other limitations
+
 - **Intermittent empty searches.** YouTube answers roughly one search in three
   from Cloudflare's ranges with a well-formed but result-free payload — a soft
   bot check with nothing to catch. Mitigated by retrying up to 3 times, plus an
-  edge-cached last-known-good feed so the home page is never empty. The player
-  endpoint has not shown this behaviour. If it starts, set `YT_PROXY_URL`.
+  edge-cached last-known-good feed so the home page is never empty.
 - **4K merges are memory-hungry.** Both tracks are held in browser memory. A
   long 2160p video can exhaust it; 1440p is much lighter.
 - **Live streams** are not downloadable (HLS manifests are not handled).
