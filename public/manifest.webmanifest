@@ -1,0 +1,66 @@
+{
+  "name": "SageTube - YouTube Video & Audio Downloader",
+  "short_name": "SageTube",
+  "description": "Browse YouTube and download any video as MP4 up to 4K, or extract the audio as MP3. Runs entirely in your browser.",
+  "id": "/",
+  "start_url": "/?src=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#0f0f0f",
+  "theme_color": "#0f0f0f",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["utilities", "multimedia", "productivity"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "YouTube to MP3",
+      "short_name": "MP3",
+      "url": "/youtube-to-mp3",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "YouTube to MP4",
+      "short_name": "MP4",
+      "url": "/youtube-to-mp4",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Trending",
+      "short_name": "Trending",
+      "url": "/category/trending",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ],
+  "share_target": {
+    "action": "/search",
+    "method": "GET",
+    "enctype": "application/x-www-form-urlencoded",
+    "params": {
+      "title": "title",
+      "text": "q",
+      "url": "u"
+    }
+  }
+}

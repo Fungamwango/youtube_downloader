@@ -24,13 +24,32 @@ export interface ClientProfile {
 }
 
 /**
- * Order matters. ANDROID_VR is first because as of now it is the only client
- * that reliably returns un-throttled, un-ciphered URLs *and* does not demand a
- * PO token. IOS is a close second but its HLS-only responses are more common.
- * The TV client is the last resort — it works for age-gated/embed-restricted
- * videos that the other two refuse.
+ * Order matters, and it is measured rather than assumed. Tested across a
+ * sample of videos, IOS answered every one with direct URLs; ANDROID_VR
+ * answered one in four and returned LOGIN_REQUIRED ("Sign in to confirm you're
+ * not a bot") for the rest; ANDROID, the music clients, WEB_CREATOR and both
+ * embedded-player clients failed outright. So IOS leads and ANDROID_VR backs it
+ * up, since the two fail on different videos.
+ *
+ * Re-check this order when extraction starts failing broadly: which clients
+ * YouTube accepts changes every few months, and the fix is usually a reorder
+ * or a client-version bump rather than new logic.
  */
 export const CLIENTS: ClientProfile[] = [
+  {
+    name: "IOS",
+    clientName: "IOS",
+    clientVersion: "20.10.4",
+    clientId: "5",
+    userAgent:
+      "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X; en_US)",
+    extraContext: {
+      deviceMake: "Apple",
+      deviceModel: "iPhone16,2",
+      osName: "iPhone",
+      osVersion: "18.3.2.22D82",
+    },
+  },
   {
     name: "ANDROID_VR",
     clientName: "ANDROID_VR",
@@ -47,27 +66,14 @@ export const CLIENTS: ClientProfile[] = [
     },
   },
   {
-    name: "IOS",
-    clientName: "IOS",
-    clientVersion: "20.10.4",
-    clientId: "5",
-    userAgent:
-      "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X; en_US)",
-    extraContext: {
-      deviceMake: "Apple",
-      deviceModel: "iPhone16,2",
-      osName: "iPhone",
-      osVersion: "18.3.2.22D82",
-    },
-  },
-  {
-    name: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-    clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-    clientVersion: "2.0",
-    clientId: "85",
-    userAgent:
-      "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
-    thirdParty: true,
+    // Rarely succeeds now, but it is cheap and occasionally covers a video the
+    // other two refuse. TVHTML5_SIMPLY_EMBEDDED_PLAYER was dropped: it returns
+    // "YouTube is no longer supported in this application" for everything.
+    name: "TVHTML5",
+    clientName: "TVHTML5",
+    clientVersion: "7.20250712.16.00",
+    clientId: "7",
+    userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.master.0",
   },
 ];
 

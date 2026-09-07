@@ -146,16 +146,7 @@ async function innertube(
   return res.json();
 }
 
-export async function search(
-  query: string,
-  env: { YT_PROXY_URL?: string },
-  limit = 30,
-): Promise<FeedItem[]> {
-  const data = await innertube(
-    "search",
-    { query, params: FILTER_VIDEOS_ONLY },
-    env,
-  );
+function parseResults(data: unknown, limit: number, excludeLive?: boolean): FeedItem[] {
   const raw: AnyObj[] = [];
   collectRenderers(data, raw);
 
@@ -164,6 +155,11 @@ export async function search(
   for (const r of raw) {
     const item = toFeedItem(r);
     if (!item || seen.has(item.id)) continue;
+    // Live and upcoming streams have no duration. They dominate results for
+    // broad queries like "news" or "gaming", and they cannot be downloaded
+    // anyway (the player returns an HLS manifest, not fixed streams), so the
+    // browse feeds drop them. Explicit searches keep them.
+    if (excludeLive && (item.live || !item.duration)) continue;
     seen.add(item.id);
     items.push(item);
     if (items.length >= limit) break;
@@ -172,25 +168,88 @@ export async function search(
 }
 
 /**
+ * YouTube intermittently answers searches from Cloudflare's ranges with a
+ * well-formed but result-free payload — a soft bot check rather than an error,
+ * so there is nothing to catch. Measured at roughly one request in three, and
+ * the same query succeeds on an immediate retry, so retrying is what makes the
+ * feed dependable.
+ */
+export async function search(
+  query: string,
+  env: { YT_PROXY_URL?: string },
+  limit = 30,
+  opts?: { excludeLive?: boolean },
+): Promise<FeedItem[]> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const data = await innertube("search", { query, params: FILTER_VIDEOS_ONLY }, env);
+      const items = parseResults(data, limit, opts?.excludeLive);
+      if (items.length) return items;
+    } catch (err) {
+      lastErr = err;
+    }
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 120 * (attempt + 1)));
+  }
+  if (lastErr) throw lastErr;
+  return [];
+}
+
+/**
  * The home grid. YouTube's FEtrending browse id now rejects anonymous WEB
  * requests, so each "category" is a curated search instead — same grid, and it
  * keeps working when the browse surface changes.
  */
 export const CATEGORIES: { id: string; label: string; query: string }[] = [
-  { id: "trending", label: "Trending", query: "trending this week" },
+  // Queries lean towards produced, finished uploads. Broad terms like "news"
+  // or "gaming" return mostly 24/7 live channels, which are filtered out and
+  // would otherwise leave the grid nearly empty.
+  { id: "trending", label: "Trending", query: "most viewed videos this week" },
   { id: "music", label: "Music", query: "official music video 2026" },
-  { id: "gaming", label: "Gaming", query: "gaming highlights" },
+  { id: "gaming", label: "Gaming", query: "gameplay walkthrough 2026" },
   { id: "movies", label: "Movies", query: "official movie trailer 2026" },
-  { id: "news", label: "News", query: "news today" },
-  { id: "sports", label: "Sports", query: "sports highlights" },
+  { id: "news", label: "News", query: "news recap this week" },
+  { id: "sports", label: "Sports", query: "match highlights 2026" },
   { id: "learning", label: "Learning", query: "documentary explained" },
   { id: "podcasts", label: "Podcasts", query: "podcast full episode" },
 ];
 
+/**
+ * Category feed, with a last-known-good fallback.
+ *
+ * Even with retries a search can come back empty, and an empty home page looks
+ * broken. Successful feeds are stashed in the edge cache and replayed when a
+ * later fetch yields nothing, so visitors always see a populated grid.
+ */
 export async function feed(
   categoryId: string,
   env: { YT_PROXY_URL?: string },
 ): Promise<FeedItem[]> {
   const cat = CATEGORIES.find((c) => c.id === categoryId) ?? CATEGORIES[0];
-  return search(cat.query, env, 30);
+  const cacheKey = new Request(`https://feed.sagetube.internal/${cat.id}`);
+  const cache = caches.default;
+
+  let items: FeedItem[] = [];
+  try {
+    items = await search(cat.query, env, 30, { excludeLive: true });
+  } catch {
+    items = [];
+  }
+
+  if (items.length) {
+    await cache.put(
+      cacheKey,
+      new Response(JSON.stringify(items), {
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "max-age=1800",
+        },
+      }),
+    );
+    return items;
+  }
+
+  const stale = await cache.match(cacheKey);
+  if (stale) return (await stale.json()) as FeedItem[];
+  return [];
 }

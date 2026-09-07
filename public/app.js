@@ -1,8 +1,8 @@
-/* GrabTube client.
+/* SageTube client.
  *
  * The server already rendered the grid, the video metadata and the quality
- * table, so this file only adds behaviour: the quality sheet, the download
- * queue, and the in-browser merge for resolutions above 360p.
+ * table, so this file only adds behaviour: the quality sheet, and an
+ * interactive download queue with live progress, speed, ETA, cancel and retry.
  */
 (function () {
   "use strict";
@@ -12,6 +12,10 @@
   var $$ = function (sel, root) {
     return Array.prototype.slice.call((root || document).querySelectorAll(sel));
   };
+
+  /* Buffering a file in memory to show progress costs the browser's native
+     resume support, so above this size we hand the transfer to the browser. */
+  var INTERACTIVE_MAX_BYTES = 700 * 1024 * 1024;
 
   /* ------------------------------------------------------------- toasts */
 
@@ -29,7 +33,35 @@
     }, isError ? 6000 : 3500);
   }
 
-  /* ---------------------------------------------------------- nav / chrome */
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  /* --------------------------------------------------------- formatting */
+
+  function fmtBytes(n) {
+    if (!n && n !== 0) return "";
+    var u = ["B", "KB", "MB", "GB"], i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + " " + u[i];
+  }
+
+  function fmtSpeed(bytesPerSec) {
+    if (!bytesPerSec || bytesPerSec < 1) return "";
+    return fmtBytes(bytesPerSec) + "/s";
+  }
+
+  function fmtEta(seconds) {
+    if (!isFinite(seconds) || seconds <= 0) return "";
+    if (seconds < 60) return Math.ceil(seconds) + "s left";
+    var m = Math.floor(seconds / 60);
+    if (m < 60) return m + "m " + Math.ceil(seconds % 60) + "s left";
+    return Math.floor(m / 60) + "h " + (m % 60) + "m left";
+  }
+
+  /* ---------------------------------------------------------- nav chrome */
 
   var menuBtn = $("#menuBtn");
   var scrim = $("#scrim");
@@ -49,9 +81,7 @@
   if (searchForm) {
     searchForm.addEventListener("submit", function (e) {
       var raw = ($("#searchInput").value || "").trim();
-      var m = raw.match(
-        /(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/|\/live\/)([\w-]{11})/
-      );
+      var m = raw.match(/(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/|\/live\/)([\w-]{11})/);
       if (m) {
         e.preventDefault();
         location.href = "/watch/" + m[1];
@@ -65,9 +95,11 @@
   /* -------------------------------------------------------- download queue */
 
   var jobs = [];
+  var jobSeq = 0;
   var drawer = $("#drawer");
   var drawerBody = $("#drawerBody");
   var dlBadge = $("#dlBadge");
+  var clearDone = $("#clearDone");
 
   function openDrawer() { if (drawer) drawer.hidden = false; }
   var downloadsBtn = $("#downloadsBtn");
@@ -75,6 +107,26 @@
   var drawerClose = $("#drawerClose");
   if (drawerClose) {
     drawerClose.addEventListener("click", function () { drawer.hidden = true; });
+  }
+  if (clearDone) {
+    clearDone.addEventListener("click", function () {
+      jobs = jobs.filter(function (j) { return j.state === "running"; });
+      renderJobs();
+    });
+  }
+
+  function jobLine(j) {
+    if (j.state === "error") return j.status;
+    if (j.state === "done") return j.status;
+    if (j.state === "cancelled") return "Cancelled";
+    var bits = [j.status];
+    if (j.total) bits.push(fmtBytes(j.received) + " / " + fmtBytes(j.total));
+    else if (j.received) bits.push(fmtBytes(j.received));
+    var sp = fmtSpeed(j.speed);
+    if (sp) bits.push(sp);
+    var eta = j.total && j.speed ? fmtEta((j.total - j.received) / j.speed) : "";
+    if (eta) bits.push(eta);
+    return bits.filter(Boolean).join(" · ");
   }
 
   function renderJobs() {
@@ -84,37 +136,97 @@
       dlBadge.hidden = active === 0;
       dlBadge.textContent = String(active);
     }
+    if (clearDone) {
+      clearDone.hidden = !jobs.some(function (j) { return j.state !== "running"; });
+    }
     if (!jobs.length) {
       drawerBody.innerHTML = '<p class="empty">Nothing downloading yet.</p>';
       return;
     }
     drawerBody.innerHTML = jobs
       .map(function (j) {
+        var pct = Math.round(j.progress * 100);
+        var action = "";
+        if (j.state === "running" && j.cancellable) {
+          action = '<button class="job-x" data-cancel="' + j.id + '" aria-label="Cancel">&times;</button>';
+        } else if (j.state === "error" || j.state === "cancelled") {
+          action = '<button class="job-x retry" data-retry="' + j.id + '">Retry</button>';
+        }
         return (
           '<div class="job ' + j.state + '">' +
-          '<div class="job-title">' + escapeHtml(j.title) + "</div>" +
-          '<div class="job-sub">' + escapeHtml(j.status) + "</div>" +
-          '<div class="bar"><i style="width:' + Math.round(j.progress * 100) + '%"></i></div>' +
+          '<div class="job-head"><div class="job-title">' + escapeHtml(j.title) + "</div>" +
+          action + "</div>" +
+          '<div class="job-sub">' + escapeHtml(jobLine(j)) + "</div>" +
+          '<div class="bar' + (j.indeterminate ? " indet" : "") + '">' +
+          '<i style="width:' + (j.indeterminate ? 100 : pct) + '%"></i></div>' +
+          (j.state === "running" && !j.indeterminate
+            ? '<div class="job-foot">' + pct + "%</div>"
+            : "") +
           "</div>"
         );
       })
       .join("");
   }
 
-  function escapeHtml(s) {
-    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  // Cancel / retry are delegated so they survive every re-render.
+  if (drawerBody) {
+    drawerBody.addEventListener("click", function (e) {
+      var c = e.target.closest("[data-cancel]");
+      if (c) {
+        var job = findJob(c.getAttribute("data-cancel"));
+        if (job && job.controller) job.controller.abort();
+        return;
+      }
+      var r = e.target.closest("[data-retry]");
+      if (r) {
+        var j2 = findJob(r.getAttribute("data-retry"));
+        if (j2 && j2.retry) {
+          jobs = jobs.filter(function (x) { return x !== j2; });
+          renderJobs();
+          j2.retry();
+        }
+      }
     });
   }
 
-  function newJob(title) {
-    var job = { title: title, status: "Starting...", progress: 0, state: "running" };
+  function findJob(id) {
+    for (var i = 0; i < jobs.length; i++) if (String(jobs[i].id) === String(id)) return jobs[i];
+    return null;
+  }
+
+  function createJob(title, retryFn) {
+    var job = {
+      id: ++jobSeq,
+      title: title,
+      status: "Starting…",
+      progress: 0,
+      received: 0,
+      total: 0,
+      speed: 0,
+      state: "running",
+      indeterminate: false,
+      cancellable: true,
+      controller: null,
+      retry: retryFn || null,
+    };
     jobs.unshift(job);
     openDrawer();
     renderJobs();
+
     return {
-      update: function (status, progress) {
-        job.status = status;
+      job: job,
+      attach: function (controller) { job.controller = controller; },
+      stage: function (label, progress, indeterminate) {
+        job.status = label;
+        if (typeof progress === "number") job.progress = Math.max(0, Math.min(1, progress));
+        job.indeterminate = !!indeterminate;
+        renderJobs();
+      },
+      transfer: function (received, total, speed, progress) {
+        job.received = received;
+        job.total = total;
+        job.speed = speed;
+        job.indeterminate = !total;
         if (typeof progress === "number") job.progress = Math.max(0, Math.min(1, progress));
         renderJobs();
       },
@@ -122,24 +234,30 @@
         job.state = "done";
         job.status = status || "Saved";
         job.progress = 1;
+        job.indeterminate = false;
         renderJobs();
       },
       fail: function (msg) {
-        job.state = "error";
+        job.state = job.aborted ? "cancelled" : "error";
         job.status = msg;
+        job.indeterminate = false;
         renderJobs();
       },
+      markAborted: function () { job.aborted = true; },
+      isAborted: function () { return !!job.aborted; },
     };
   }
 
   /* ------------------------------------------------------------ utilities */
 
   function safeName(name) {
-    return String(name || "video")
-      .replace(/[\\/:*?"<>|]/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 110) || "video";
+    return (
+      String(name || "video")
+        .replace(/[\\/:*?"<>|]/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 110) || "video"
+    );
   }
 
   function saveBlob(blob, filename) {
@@ -153,9 +271,12 @@
     setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
   }
 
-  /** Streams a URL into a Uint8Array while reporting progress. */
-  function fetchWithProgress(url, onProgress) {
-    return fetch(url).then(function (res) {
+  /**
+   * Streams a URL into a Uint8Array, reporting bytes, throughput and ETA.
+   * Speed is smoothed with an EMA so the readout does not jitter per chunk.
+   */
+  function fetchWithProgress(url, onProgress, signal) {
+    return fetch(url, { signal: signal }).then(function (res) {
       if (!res.ok) {
         return res.json().catch(function () { return {}; }).then(function (body) {
           throw new Error(body.error || "Download failed (HTTP " + res.status + ")");
@@ -165,9 +286,14 @@
       if (!res.body || !res.body.getReader) {
         return res.arrayBuffer().then(function (b) { return new Uint8Array(b); });
       }
+
       var reader = res.body.getReader();
       var chunks = [];
       var received = 0;
+      var speed = 0;
+      var lastT = (window.performance || Date).now();
+      var lastB = 0;
+
       return (function pump() {
         return reader.read().then(function (r) {
           if (r.done) {
@@ -181,7 +307,16 @@
           }
           chunks.push(r.value);
           received += r.value.length;
-          if (onProgress) onProgress(total ? received / total : 0, received, total);
+
+          var now = (window.performance || Date).now();
+          var dt = (now - lastT) / 1000;
+          if (dt >= 0.35) {
+            var inst = (received - lastB) / dt;
+            speed = speed ? speed * 0.6 + inst * 0.4 : inst;
+            lastT = now;
+            lastB = received;
+          }
+          if (onProgress) onProgress(received, total, speed);
           return pump();
         });
       })();
@@ -193,6 +328,7 @@
   var FF_VER = "0.12.10";
   var FF_CORE = "0.12.6";
   var ffmpegPromise = null;
+  var ffProgressTarget = null;
 
   function loadScript(src) {
     return new Promise(function (resolve, reject) {
@@ -206,14 +342,14 @@
 
   /**
    * ffmpeg.wasm is ~32 MB, so it is only fetched the first time a merge or an
-   * MP3 conversion is actually requested. Loading from a CDN requires the
-   * worker and core to be turned into blob URLs first, otherwise the worker
-   * bootstrap is blocked as cross-origin.
+   * MP3 conversion is requested. Loading from a CDN requires the worker and
+   * core to become blob URLs first, or the worker bootstrap is blocked as
+   * cross-origin.
    */
   function getFFmpeg(onStatus) {
     if (ffmpegPromise) return ffmpegPromise;
     ffmpegPromise = (function () {
-      if (onStatus) onStatus("Loading the media engine (one time, ~32 MB)...");
+      if (onStatus) onStatus();
       var base = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@" + FF_VER + "/dist/umd";
       var coreBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@" + FF_CORE + "/dist/umd";
       var utilBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd";
@@ -230,6 +366,10 @@
         })
         .then(function (urls) {
           var ff = new window.FFmpegWASM.FFmpeg();
+          // One shared instance, so progress is routed to whichever job owns it.
+          ff.on("progress", function (e) {
+            if (ffProgressTarget) ffProgressTarget(e && e.progress ? e.progress : 0);
+          });
           return ff
             .load({ classWorkerURL: urls[0], coreURL: urls[1], wasmURL: urls[2] })
             .then(function () { return ff; });
@@ -237,8 +377,8 @@
         .catch(function (err) {
           ffmpegPromise = null;
           throw new Error(
-            "The in-browser media engine failed to load. " +
-            "You can still use the Direct qualities. (" + err.message + ")"
+            "The in-browser media engine failed to load. You can still use the " +
+              "Direct qualities. (" + err.message + ")"
           );
         });
     })();
@@ -247,52 +387,125 @@
 
   /* ------------------------------------------------------------ downloads */
 
-  function directDownload(videoId, itag, title, ext) {
-    var url =
+  function downloadUrl(videoId, itag, title) {
+    return (
       "/api/download?v=" + encodeURIComponent(videoId) +
       "&itag=" + encodeURIComponent(itag) +
-      "&title=" + encodeURIComponent(safeName(title));
-    // Let the browser own the transfer: resumable, and no memory ceiling.
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = safeName(title) + "." + ext;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    toast("Download started — check your browser downloads.");
+      "&title=" + encodeURIComponent(safeName(title))
+    );
   }
 
   function streamUrl(videoId, itag) {
     return "/api/stream?v=" + encodeURIComponent(videoId) + "&itag=" + encodeURIComponent(itag);
   }
 
-  function mergeDownload(opts) {
-    var job = newJob(opts.title + " — " + opts.label);
-    var videoBytes, audioBytes;
+  function nativeDownload(url, filename) {
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
 
-    return getFFmpeg(function (s) { job.update(s, 0.02); })
-      .then(function (ff) {
-        job.update("Downloading video track...", 0.05);
-        return fetchWithProgress(streamUrl(opts.videoId, opts.itag), function (p) {
-          job.update("Downloading video track...", 0.05 + p * 0.45);
-        }).then(function (v) {
-          videoBytes = v;
-          job.update("Downloading audio track...", 0.5);
-          return fetchWithProgress(streamUrl(opts.videoId, opts.audioItag), function (p) {
-            job.update("Downloading audio track...", 0.5 + p * 0.2);
-          });
-        }).then(function (a) {
-          audioBytes = a;
-          job.update("Merging (no re-encode)...", 0.72);
+  /**
+   * Direct qualities need no merge. Small enough files are streamed through
+   * fetch so the queue can show real progress; anything larger (or of unknown
+   * size) is handed to the browser, which keeps resume support.
+   */
+  function runDirect(o) {
+    var filename = safeName(o.title) + (o.label ? " (" + o.label + ")" : "") + "." + o.ext;
+    var known = o.sizeBytes > 0;
 
-          // Stream-copy into a container that accepts both codecs.
-          var vExt = opts.ext === "webm" ? "webm" : "mp4";
+    if (!known || o.sizeBytes > INTERACTIVE_MAX_BYTES) {
+      var handoff = createJob(o.title + " — " + (o.label || o.ext.toUpperCase()));
+      handoff.job.cancellable = false;
+      nativeDownload(downloadUrl(o.videoId, o.itag, o.title), filename);
+      handoff.done("Handed to your browser’s downloader");
+      toast("Download started — see your browser downloads.");
+      return;
+    }
+
+    var ctl = new AbortController();
+    var job = createJob(o.title + " — " + (o.label || o.ext.toUpperCase()), function () {
+      runDirect(o);
+    });
+    job.attach(ctl);
+    job.stage("Downloading…", 0);
+
+    fetchWithProgress(
+      streamUrl(o.videoId, o.itag),
+      function (received, total, speed) {
+        job.transfer(received, total || o.sizeBytes, speed, received / (total || o.sizeBytes));
+      },
+      ctl.signal
+    )
+      .then(function (bytes) {
+        job.stage("Saving…", 0.99);
+        saveBlob(new Blob([bytes]), filename);
+        job.done("Saved · " + fmtBytes(bytes.length));
+        toast("Saved " + filename);
+      })
+      .catch(function (err) {
+        if (err && err.name === "AbortError") {
+          job.markAborted();
+          job.fail("Cancelled");
+          return;
+        }
+        job.fail(err.message || "Download failed");
+        toast(err.message || "Download failed", true);
+      });
+  }
+
+  function runMerge(o) {
+    var ctl = new AbortController();
+    var job = createJob(o.title + " — " + o.label, function () { runMerge(o); });
+    job.attach(ctl);
+
+    var ff;
+    return getFFmpeg(function () {
+      job.stage("Loading the media engine (one time, ~32 MB)…", 0.02, true);
+    })
+      .then(function (instance) {
+        ff = instance;
+        job.stage("Downloading video…", 0.05);
+        return fetchWithProgress(
+          streamUrl(o.videoId, o.itag),
+          function (received, total, speed) {
+            var p = total ? received / total : 0;
+            job.transfer(received, total, speed, 0.05 + p * 0.45);
+            job.job.status = "Downloading video…";
+          },
+          ctl.signal
+        );
+      })
+      .then(function (videoBytes) {
+        job.stage("Downloading audio…", 0.5);
+        return fetchWithProgress(
+          streamUrl(o.videoId, o.audioItag),
+          function (received, total, speed) {
+            var p = total ? received / total : 0;
+            job.transfer(received, total, speed, 0.5 + p * 0.2);
+            job.job.status = "Downloading audio…";
+          },
+          ctl.signal
+        ).then(function (audioBytes) {
+          // Past this point ffmpeg owns the work and cannot be interrupted.
+          job.job.cancellable = false;
+          job.stage("Merging (no re-encode)…", 0.7);
+
+          var vExt = o.ext === "webm" ? "webm" : "mp4";
           var outExt = vExt === "mp4" ? "mp4" : "webm";
           var vName = "v." + vExt;
-          var aName = "a." + (opts.audioExt || "m4a");
+          var aName = "a." + (o.audioExt || "m4a");
           var outName = "out." + outExt;
 
-          return ff.writeFile(vName, videoBytes)
+          ffProgressTarget = function (p) {
+            job.stage("Merging (no re-encode)…", 0.7 + Math.min(p, 1) * 0.25);
+          };
+
+          return ff
+            .writeFile(vName, videoBytes)
             .then(function () { return ff.writeFile(aName, audioBytes); })
             .then(function () {
               return ff.exec([
@@ -307,52 +520,85 @@
             })
             .then(function () { return ff.readFile(outName); })
             .then(function (data) {
-              job.update("Saving...", 0.97);
+              ffProgressTarget = null;
+              job.stage("Saving…", 0.97);
               var blob = new Blob([data.buffer || data], {
                 type: outExt === "mp4" ? "video/mp4" : "video/webm",
               });
-              saveBlob(blob, safeName(opts.title) + " (" + opts.label + ")." + outExt);
-              // Free MEMFS so a second merge does not accumulate memory.
+              saveBlob(blob, safeName(o.title) + " (" + o.label + ")." + outExt);
+              // Free MEMFS so repeat merges do not accumulate memory.
               ff.deleteFile(vName).catch(function () {});
               ff.deleteFile(aName).catch(function () {});
               ff.deleteFile(outName).catch(function () {});
-              job.done("Saved — " + opts.label);
-              toast("Saved " + opts.label + " file.");
+              job.done("Saved · " + o.label + " · " + fmtBytes(blob.size));
+              toast("Saved " + o.label + " file.");
             });
         });
       })
       .catch(function (err) {
+        ffProgressTarget = null;
+        if (err && err.name === "AbortError") {
+          job.markAborted();
+          job.fail("Cancelled");
+          return;
+        }
         job.fail(err.message || "Merge failed");
         toast(err.message || "Merge failed", true);
       });
   }
 
-  function mp3Download(opts) {
-    var job = newJob(opts.title + " — MP3");
-    return getFFmpeg(function (s) { job.update(s, 0.02); })
-      .then(function (ff) {
-        job.update("Downloading audio...", 0.1);
-        return fetchWithProgress(streamUrl(opts.videoId, opts.itag), function (p) {
-          job.update("Downloading audio...", 0.1 + p * 0.5);
-        }).then(function (bytes) {
-          job.update("Converting to MP3...", 0.65);
-          var inName = "a." + (opts.ext || "m4a");
-          return ff.writeFile(inName, bytes)
-            .then(function () {
-              return ff.exec(["-i", inName, "-vn", "-b:a", "192k", "out.mp3"]);
-            })
-            .then(function () { return ff.readFile("out.mp3"); })
-            .then(function (data) {
-              var blob = new Blob([data.buffer || data], { type: "audio/mpeg" });
-              saveBlob(blob, safeName(opts.title) + ".mp3");
-              ff.deleteFile(inName).catch(function () {});
-              ff.deleteFile("out.mp3").catch(function () {});
-              job.done("Saved MP3");
-              toast("Saved MP3.");
-            });
-        });
+  function runMp3(o) {
+    var ctl = new AbortController();
+    var job = createJob(o.title + " — MP3", function () { runMp3(o); });
+    job.attach(ctl);
+
+    var ff;
+    return getFFmpeg(function () {
+      job.stage("Loading the media engine (one time, ~32 MB)…", 0.02, true);
+    })
+      .then(function (instance) {
+        ff = instance;
+        job.stage("Downloading audio…", 0.1);
+        return fetchWithProgress(
+          streamUrl(o.videoId, o.itag),
+          function (received, total, speed) {
+            var p = total ? received / total : 0;
+            job.transfer(received, total, speed, 0.1 + p * 0.5);
+            job.job.status = "Downloading audio…";
+          },
+          ctl.signal
+        );
+      })
+      .then(function (bytes) {
+        job.job.cancellable = false;
+        job.stage("Converting to MP3…", 0.65);
+        var inName = "a." + (o.ext || "m4a");
+        ffProgressTarget = function (p) {
+          job.stage("Converting to MP3…", 0.65 + Math.min(p, 1) * 0.3);
+        };
+        return ff
+          .writeFile(inName, bytes)
+          .then(function () {
+            return ff.exec(["-i", inName, "-vn", "-b:a", "192k", "out.mp3"]);
+          })
+          .then(function () { return ff.readFile("out.mp3"); })
+          .then(function (data) {
+            ffProgressTarget = null;
+            var blob = new Blob([data.buffer || data], { type: "audio/mpeg" });
+            saveBlob(blob, safeName(o.title) + ".mp3");
+            ff.deleteFile(inName).catch(function () {});
+            ff.deleteFile("out.mp3").catch(function () {});
+            job.done("Saved MP3 · " + fmtBytes(blob.size));
+            toast("Saved MP3.");
+          });
       })
       .catch(function (err) {
+        ffProgressTarget = null;
+        if (err && err.name === "AbortError") {
+          job.markAborted();
+          job.fail("Cancelled");
+          return;
+        }
         job.fail(err.message || "Conversion failed");
         toast(err.message || "Conversion failed", true);
       });
@@ -362,36 +608,34 @@
 
   function bindFormatButton(btn, videoId, title, audioFallback) {
     btn.addEventListener("click", function () {
-      var itag = Number(btn.getAttribute("data-itag"));
-      var kind = btn.getAttribute("data-kind");
+      var o = {
+        videoId: videoId,
+        title: title,
+        itag: Number(btn.getAttribute("data-itag")),
+        label: btn.getAttribute("data-label") || "",
+        ext: btn.getAttribute("data-ext") || "mp4",
+        sizeBytes: Number(btn.getAttribute("data-size")) || 0,
+        audioItag: Number(btn.getAttribute("data-audio-itag")) || audioFallback,
+      };
       var needsMux = btn.getAttribute("data-mux") === "1";
-      var label = btn.getAttribute("data-label") || "";
-      var ext = btn.getAttribute("data-ext") || "mp4";
-      var audioItag = Number(btn.getAttribute("data-audio-itag")) || audioFallback;
+      var isMp3 = btn.getAttribute("data-mp3") === "1";
+
+      // Momentary feedback so the click is obviously registered.
+      btn.classList.add("busy");
+      setTimeout(function () { btn.classList.remove("busy"); }, 900);
 
       closeSheet();
 
-      if (btn.getAttribute("data-mp3") === "1") {
-        mp3Download({ videoId: videoId, itag: itag, title: title, ext: ext });
-        return;
-      }
-      if (!needsMux) {
-        directDownload(videoId, itag, title, ext);
-        return;
-      }
-      if (!audioItag) {
+      if (isMp3) {
+        runMp3(o);
+      } else if (!needsMux) {
+        runDirect(o);
+      } else if (!o.audioItag) {
         toast("No audio track available to merge with.", true);
-        return;
+      } else {
+        o.audioExt = "m4a";
+        runMerge(o);
       }
-      mergeDownload({
-        videoId: videoId,
-        itag: itag,
-        audioItag: audioItag,
-        title: title,
-        label: label,
-        ext: ext,
-        audioExt: kind === "video" ? "m4a" : ext,
-      });
     });
   }
 
@@ -422,8 +666,8 @@
       bindFormatButton(btn, wId, wTitle, wAudio);
     });
 
-    // MP3 is a conversion rather than one of YouTube's formats, so it is
-    // appended client-side (it needs ffmpeg, which only exists in the browser).
+    // MP3 is a conversion rather than one of YouTube's formats, so it is added
+    // client-side (it needs ffmpeg, which only exists in the browser).
     var audioPane = $('[data-pane="audio"]', watchFormats);
     if (audioPane && INITIAL.audio && INITIAL.audio.length) {
       var src = INITIAL.audio[0];
@@ -435,6 +679,7 @@
       mp3.setAttribute("data-mp3", "1");
       mp3.setAttribute("data-ext", src.ext || "m4a");
       mp3.setAttribute("data-label", "MP3");
+      mp3.setAttribute("data-size", src.sizeBytes || "");
       mp3.innerHTML =
         '<span class="fmt-q">MP3</span>' +
         '<span class="fmt-info"><b>192 kbps &middot; converted in your browser</b>' +
@@ -462,10 +707,13 @@
 
   function renderSheet(info) {
     $("#sheetTitle").textContent = info.title;
-    $("#sheetSub").textContent =
-      [info.channel, info.duration, info.views ? info.views + " views" : ""]
-        .filter(Boolean)
-        .join(" · ");
+    $("#sheetSub").textContent = [
+      info.channel,
+      info.duration,
+      info.views ? info.views + " views" : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
     $("#sheetThumb").src = info.thumbnail;
 
     function rowHtml(f, isMp3) {
@@ -473,11 +721,16 @@
       var detail = isMp3
         ? "192 kbps &middot; converted in your browser"
         : escapeHtml(f.ext.toUpperCase()) + " &middot; " + escapeHtml(f.codec) +
-          (f.kind === "progressive" ? " &middot; with audio" : f.needsMux ? " &middot; merged in your browser" : "");
+          (f.kind === "progressive"
+            ? " &middot; with audio"
+            : f.needsMux
+              ? " &middot; merged in your browser"
+              : "");
       return (
         '<button class="fmt" data-itag="' + f.itag + '" data-kind="' + escapeHtml(f.kind) +
         '" data-mux="' + (f.needsMux ? 1 : 0) + '" data-audio-itag="' + (f.muxAudioItag || "") +
-        '" data-ext="' + escapeHtml(f.ext) + '" data-label="' + escapeHtml(isMp3 ? "MP3" : f.label) + '"' +
+        '" data-ext="' + escapeHtml(f.ext) + '" data-size="' + (f.sizeBytes || "") +
+        '" data-label="' + escapeHtml(isMp3 ? "MP3" : f.label) + '"' +
         (isMp3 ? ' data-mp3="1"' : "") + ">" +
         '<span class="fmt-q">' + escapeHtml(isMp3 ? "MP3" : f.label) + "</span>" +
         '<span class="fmt-info"><b>' + detail + "</b>" + escapeHtml(f.sizeText || "") + "</span>" +
@@ -503,11 +756,8 @@
       bindFormatButton(btn, info.id, info.title, fallback);
     });
 
-    // Reset to the Video tab each time the sheet opens.
     var tabs = $("#sheetTabs");
-    $$(".tab", tabs).forEach(function (t, i) {
-      t.classList.toggle("active", i === 0);
-    });
+    $$(".tab", tabs).forEach(function (t, i) { t.classList.toggle("active", i === 0); });
     $$("[data-pane]", sheetBody).forEach(function (p) {
       p.hidden = p.getAttribute("data-pane") !== "video";
     });
@@ -517,11 +767,11 @@
   function openSheet(videoId, title) {
     if (!sheetWrap) return;
     sheetWrap.hidden = false;
-    $("#sheetTitle").textContent = title || "Loading...";
+    $("#sheetTitle").textContent = title || "Loading…";
     $("#sheetSub").textContent = "";
     $("#sheetThumb").src = "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg";
     sheetBody.innerHTML =
-      '<div class="loading"><span class="spinner"></span> Fetching available qualities...</div>';
+      '<div class="loading"><span class="spinner"></span> Fetching available qualities…</div>';
 
     if (!sheetTabsBound) {
       bindTabs($("#sheetTabs"), sheetBody);
@@ -550,6 +800,64 @@
     e.preventDefault();
     var card = btn.closest(".card");
     openSheet(btn.getAttribute("data-dl"), card ? card.getAttribute("data-title") : "");
+  });
+
+  /* ------------------------------------------------------- fixed zoom */
+
+  /* iOS Safari has ignored user-scalable=no since iOS 10, so pinch-zoom has to
+     be cancelled explicitly. Only multi-touch is blocked - one-finger
+     scrolling, taps and drags all behave normally. Double-tap zoom is already
+     handled by `touch-action: manipulation` in the stylesheet. */
+  ["gesturestart", "gesturechange", "gestureend"].forEach(function (evt) {
+    document.addEventListener(evt, function (e) { e.preventDefault(); }, { passive: false });
+  });
+  document.addEventListener(
+    "touchmove",
+    function (e) {
+      if (e.touches && e.touches.length > 1) e.preventDefault();
+    },
+    { passive: false }
+  );
+
+  /* ------------------------------------------------------------ PWA */
+
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("/sw.js").catch(function () {
+        // Registration failing only costs offline support; the app still works.
+      });
+    });
+  }
+
+  // Chrome/Edge fire this instead of showing their own prompt, so the button
+  // stays hidden until the browser confirms the app is actually installable.
+  var deferredPrompt = null;
+  var installBtn = $("#installBtn");
+
+  window.addEventListener("beforeinstallprompt", function (e) {
+    e.preventDefault();
+    deferredPrompt = e;
+    if (installBtn) installBtn.hidden = false;
+  });
+
+  if (installBtn) {
+    installBtn.addEventListener("click", function () {
+      if (!deferredPrompt) return;
+      deferredPrompt.prompt();
+      deferredPrompt.userChoice.then(function (choice) {
+        if (choice && choice.outcome === "accepted") {
+          installBtn.hidden = true;
+          toast("Installing SageTube…");
+        }
+        deferredPrompt = null;
+      });
+    });
+  }
+
+  window.addEventListener("appinstalled", function () {
+    deferredPrompt = null;
+    if (installBtn) installBtn.hidden = true;
+    toast("SageTube installed.");
   });
 
   renderJobs();

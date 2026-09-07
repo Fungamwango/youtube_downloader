@@ -10,6 +10,7 @@ import { fetchPlayer, parseVideoId, ExtractionError } from "./innertube";
 import { extractFormats } from "./formats";
 import { streamFormat } from "./stream";
 import { search, feed, CATEGORIES } from "./search";
+import { LANDING_PAGES, findLanding, type LandingPage } from "./landing";
 import {
   layout,
   gridHtml,
@@ -244,6 +245,66 @@ async function watchPage(videoId: string, origin: string, env: Env) {
   );
 }
 
+/** The paste-a-link box that every landing page leads with. */
+function converterBox(placeholder: string): string {
+  return `<form class="hero-box" action="/search" method="get" role="search">
+    <input name="q" type="search" required
+      placeholder="${esc(placeholder)}" aria-label="YouTube link" />
+    <button type="submit">Get it</button>
+  </form>`;
+}
+
+function landingPageHtml(page: LandingPage, origin: string) {
+  const others = LANDING_PAGES.filter((p) => p.slug !== page.slug);
+  const canonical = `${origin}/${page.slug}`;
+
+  const body = `
+    <div class="page-head">
+      <h1>${esc(page.h1)}</h1>
+      <p>${esc(page.intro)}</p>
+    </div>
+    ${converterBox("Paste a YouTube link...")}
+    <section class="seo" style="margin-top:32px">
+      ${page.sections.map((s) => `<h2>${esc(s.h2)}</h2><p>${esc(s.body)}</p>`).join("")}
+      <h2>Questions</h2>
+      ${page.faq.map((f) => `<h3>${esc(f.q)}</h3><p>${esc(f.a)}</p>`).join("")}
+      <h2>More download tools</h2>
+      <ul>
+        ${others.map((p) => `<li><a href="/${p.slug}" style="color:#3ea6ff">${esc(p.h1)}</a></li>`).join("")}
+        <li><a href="/how-to-download" style="color:#3ea6ff">How to download a YouTube video</a></li>
+      </ul>
+    </section>`;
+
+  return html(
+    layout({
+      title: `${page.title} | ${SITE_NAME}`,
+      description: page.description,
+      canonical,
+      origin,
+      body,
+      jsonLd: [
+        {
+          "@context": "https://schema.org",
+          "@type": "FAQPage",
+          mainEntity: page.faq.map((f) => ({
+            "@type": "Question",
+            name: f.q,
+            acceptedAnswer: { "@type": "Answer", text: f.a },
+          })),
+        },
+        {
+          "@context": "https://schema.org",
+          "@type": "BreadcrumbList",
+          itemListElement: [
+            { "@type": "ListItem", position: 1, name: "Home", item: `${origin}/` },
+            { "@type": "ListItem", position: 2, name: page.h1, item: canonical },
+          ],
+        },
+      ],
+    }),
+  );
+}
+
 async function searchPage(q: string, origin: string, env: Env) {
   const items = q ? await search(q, env).catch(() => []) : [];
   const body = `
@@ -270,12 +331,12 @@ async function searchPage(q: string, origin: string, env: Env) {
 
 const FAQ = [
   {
-    q: "Is GrabTube free to use?",
+    q: "Is SageTube free to use?",
     a: "Yes. There is no account, no subscription and no download limit.",
   },
   {
     q: "Why does 1080p need to be merged?",
-    a: "YouTube only serves a ready-made video-plus-audio file at 360p. Every higher resolution is delivered as a separate video track and audio track, so the two must be joined before the file will play with sound. GrabTube does that inside your browser.",
+    a: "YouTube only serves a ready-made video-plus-audio file at 360p. Every higher resolution is delivered as a separate video track and audio track, so the two must be joined before the file will play with sound. SageTube does that inside your browser.",
   },
   {
     q: "Does merging re-encode and lose quality?",
@@ -391,8 +452,15 @@ Sitemap: ${origin}/sitemap.xml
 async function sitemap(origin: string, env: Env) {
   const urls: { loc: string; priority: string; changefreq: string }[] = [
     { loc: `${origin}/`, priority: "1.0", changefreq: "hourly" },
-    { loc: `${origin}/how-to-download`, priority: "0.6", changefreq: "monthly" },
+    { loc: `${origin}/how-to-download`, priority: "0.7", changefreq: "monthly" },
     { loc: `${origin}/faq`, priority: "0.6", changefreq: "monthly" },
+    // Keyword landing pages carry the commercial intent, so they rank above
+    // the category feeds in priority.
+    ...LANDING_PAGES.map((p) => ({
+      loc: `${origin}/${p.slug}`,
+      priority: "0.9",
+      changefreq: "weekly",
+    })),
     ...CATEGORIES.map((c) => ({
       loc: `${origin}/category/${c.id}`,
       priority: "0.8",
@@ -550,7 +618,25 @@ export default {
       if (path === "/") return await homePage(origin, env);
       if (path === "/faq") return faqPage(origin);
       if (path === "/how-to-download") return howToPage(origin);
-      if (path === "/search") return await searchPage((url.searchParams.get("q") ?? "").trim(), origin, env);
+      const landing = findLanding(path.slice(1));
+      if (landing) return landingPageHtml(landing, origin);
+
+      if (path === "/search") {
+        // `u` and `text` arrive from the PWA share target when a link is
+        // shared into the app from another app's share sheet.
+        const q = (
+          url.searchParams.get("q") ??
+          url.searchParams.get("u") ??
+          url.searchParams.get("text") ??
+          ""
+        ).trim();
+        // A pasted link is a request for one specific video, not a query.
+        const pasted = parseVideoId(q);
+        if (pasted && (/https?:|youtu/i.test(q) || /^[\w-]{11}$/.test(q))) {
+          return Response.redirect(`${origin}/watch/${pasted}`, 302);
+        }
+        return await searchPage(q, origin, env);
+      }
 
       const cat = path.match(/^\/category\/([\w-]+)$/);
       if (cat) {

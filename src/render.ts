@@ -12,8 +12,9 @@
 import type { FeedItem } from "./search";
 import type { UiFormat } from "./formats";
 import { CATEGORIES } from "./search";
+import { LANDING_PAGES } from "./landing";
 
-export const SITE_NAME = "GrabTube";
+export const SITE_NAME = "SageTube";
 export const SITE_TAGLINE = "YouTube Video & Audio Downloader";
 
 export function esc(s: unknown): string {
@@ -30,8 +31,8 @@ function safeJson(data: unknown): string {
   return JSON.stringify(data)
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
-    .replace(/ /g, "\\u2028")
-    .replace(/ /g, "\\u2029");
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 /** Seconds -> ISO 8601 duration, which is what schema.org expects. */
@@ -65,9 +66,16 @@ function navHtml(active?: string): string {
       <span>${esc(c.label)}</span></a>`,
   ).join("");
   return `
+    <button class="side-item install" id="installBtn" hidden>
+      <span>Install app</span>
+    </button>
     <a class="side-item${!active ? " active" : ""}" href="/"><span>Home</span></a>
     <div class="side-sep"></div>
     ${items}
+    <div class="side-sep"></div>
+    ${LANDING_PAGES.map(
+      (p) => `<a class="side-item" href="/${p.slug}"><span>${esc(p.h1)}</span></a>`,
+    ).join("")}
     <div class="side-sep"></div>
     <a class="side-item" href="/how-to-download"><span>How it works</span></a>
     <a class="side-item" href="/faq"><span>FAQ</span></a>
@@ -95,7 +103,7 @@ export function layout(o: LayoutOptions): string {
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>${esc(o.title)}</title>
 <meta name="description" content="${esc(o.description)}" />
 <link rel="canonical" href="${esc(o.canonical)}" />
@@ -112,6 +120,14 @@ ${o.noindex ? '<meta name="robots" content="noindex, follow" />' : '<meta name="
 <meta name="twitter:description" content="${esc(o.description)}" />
 <meta name="twitter:image" content="${esc(ogImage)}" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff0033'/%3E%3Cpath d='M13 9l10 7-10 7z' fill='%23fff'/%3E%3C/svg%3E" />
+<link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png" />
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+<link rel="manifest" href="/manifest.webmanifest" />
+<meta name="application-name" content="${SITE_NAME}" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="${SITE_NAME}" />
+<meta name="mobile-web-app-capable" content="yes" />
 <link rel="preconnect" href="https://i.ytimg.com" />
 <link rel="dns-prefetch" href="https://i.ytimg.com" />
 <link rel="stylesheet" href="/styles.css" />
@@ -126,7 +142,7 @@ ${jsonLd}
 
   <a class="brand" href="/" aria-label="${SITE_NAME} home">
     <span class="brand-mark"><svg viewBox="0 0 24 24"><path d="M9 7l9 5-9 5z"/></svg></span>
-    <span class="brand-text">Grab<span>Tube</span></span>
+    <span class="brand-text">Sage<span>Tube</span></span>
   </a>
 
   <form class="searchbar" id="searchForm" role="search" action="/search" method="get">
@@ -179,6 +195,7 @@ ${jsonLd}
 <aside class="drawer" id="drawer" hidden>
   <div class="drawer-head">
     <h3>Downloads</h3>
+    <button class="text-btn" id="clearDone" hidden>Clear finished</button>
     <button class="icon-btn" id="drawerClose" aria-label="Close">
       <svg viewBox="0 0 24 24"><path d="M19 6.4L17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg>
     </button>
@@ -246,7 +263,8 @@ export function formatTableHtml(
       : `${f.ext.toUpperCase()} &middot; ${f.codec} &middot; merged with best audio in your browser`;
     return `<button class="fmt" data-itag="${f.itag}" data-kind="${f.kind}"
       data-mux="${f.needsMux ? 1 : 0}" data-audio-itag="${f.muxAudioItag ?? ""}"
-      data-label="${esc(f.label)}" data-ext="${esc(f.ext)}">
+      data-label="${esc(f.label)}" data-ext="${esc(f.ext)}"
+      data-size="${f.sizeBytes ?? ""}">
       <span class="fmt-q">${esc(f.label)}</span>
       <span class="fmt-info"><b>${esc(detail)}</b>${f.sizeText ? esc(f.sizeText) : ""}</span>
       ${pill}

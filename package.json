@@ -1,5 +1,5 @@
 {
-  "name": "grabtube",
+  "name": "sagetube",
   "version": "1.0.0",
   "private": true,
   "description": "VidMate-style YouTube downloader running entirely on Cloudflare Workers",

@@ -172,12 +172,15 @@ export function extractFormats(player: PlayerResponse): ExtractedFormats {
     (a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.fps ?? 0) - (a.fps ?? 0),
   );
 
-  // De-dupe audio down to distinct bitrates, keeping the best codec of each.
-  const seenAbr = new Set<number>();
+  // Collapse audio to distinct quality tiers. YouTube ships an AAC and an Opus
+  // version of each tier (e.g. 130 kbps m4a alongside 129 kbps webm); listing
+  // both is noise, so keep the first — the list is already sorted AAC-first,
+  // loudest-first — and drop anything within 20 kbps of something kept.
+  const kept: number[] = [];
   const audioOut = audio.filter((a) => {
-    const key = a.abr ?? 0;
-    if (seenAbr.has(key)) return false;
-    seenAbr.add(key);
+    const abr = a.abr ?? 0;
+    if (kept.some((k) => Math.abs(k - abr) <= 20)) return false;
+    kept.push(abr);
     return true;
   });
 
