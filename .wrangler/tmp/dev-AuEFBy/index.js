@@ -41,14 +41,25 @@ var CLIENTS = [
     userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.master.0"
   }
 ];
-function proxied(targetUrl, env) {
-  const base = (env.YT_PROXY_URL ?? "").trim();
-  if (!base) return targetUrl;
-  if (base.includes("{url}")) return base.replace("{url}", encodeURIComponent(targetUrl));
+function viaProxy(targetUrl, base) {
+  const b = (base ?? "").trim();
+  if (!b) return targetUrl;
+  if (b.includes("{url}")) return b.replace("{url}", encodeURIComponent(targetUrl));
   const u = new URL(targetUrl);
-  return base.replace(/\/$/, "") + u.pathname + u.search;
+  return b.replace(/\/$/, "") + u.pathname + u.search;
+}
+__name(viaProxy, "viaProxy");
+function proxied(targetUrl, env) {
+  return viaProxy(targetUrl, env.YT_PROXY_URL);
 }
 __name(proxied, "proxied");
+function mediaProxyBase(env) {
+  const explicit = (env.YT_MEDIA_PROXY_URL ?? "").trim();
+  if (explicit) return explicit;
+  const shared = (env.YT_PROXY_URL ?? "").trim();
+  return shared.includes("{url}") ? shared : void 0;
+}
+__name(mediaProxyBase, "mediaProxyBase");
 var INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 var PLAYER_URL = "https://www.youtube.com/youtubei/v1/player?key=" + INNERTUBE_KEY + "&prettyPrint=false";
 var ExtractionError = class extends Error {
@@ -109,18 +120,15 @@ async function callPlayer(client, videoId, env) {
     }
   });
   const target = proxied(PLAYER_URL, env);
-  const res = await fetch(target, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": client.userAgent,
-      "X-YouTube-Client-Name": client.clientId,
-      "X-YouTube-Client-Version": client.clientVersion,
-      Origin: "https://www.youtube.com",
-      "Accept-Language": "en-US,en;q=0.9"
-    },
-    body
-  });
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": client.userAgent,
+    "X-YouTube-Client-Name": client.clientId,
+    "X-YouTube-Client-Version": client.clientVersion,
+    Origin: "https://www.youtube.com",
+    "Accept-Language": "en-US,en;q=0.9"
+  };
+  const res = await fetch(target, { method: "POST", headers, body });
   if (!res.ok) {
     throw new ExtractionError(
       `YouTube rejected the ${client.name} request`,
@@ -138,20 +146,62 @@ function hasUsableStreams(pr) {
   return all.some((f) => !!f.url);
 }
 __name(hasUsableStreams, "hasUsableStreams");
-async function fetchPlayer(videoId, env) {
+async function callPlayerWithRetry(client, videoId, env, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await callPlayer(client, videoId, env);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+__name(callPlayerWithRetry, "callPlayerWithRetry");
+async function fetchPlayer(videoId, env, opts) {
+  const cacheKey = new Request(`https://player.sagetube.internal/${videoId}`);
+  const cache = caches.default;
+  if (!opts?.fresh) {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) {
+        const cached = await hit.json();
+        if (cached?.player) return cached;
+      }
+    } catch {
+    }
+  }
   const failures = [];
+  let transportOnly = true;
   for (const client of CLIENTS) {
     let pr;
     try {
-      pr = await callPlayer(client, videoId, env);
+      pr = await callPlayerWithRetry(client, videoId, env);
     } catch (err) {
       failures.push(`${client.name}: ${err.message}`);
       continue;
     }
     const status = pr.playabilityStatus?.status ?? "UNKNOWN";
     if (status === "OK" && hasUsableStreams(pr)) {
-      return { player: pr, client: client.name };
+      const result = { player: pr, client: client.name };
+      try {
+        await cache.put(
+          cacheKey,
+          new Response(JSON.stringify(result), {
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "max-age=240"
+            }
+          })
+        );
+      } catch {
+      }
+      return result;
     }
+    transportOnly = false;
     const reason = pr.playabilityStatus?.reason ?? pr.playabilityStatus?.messages?.join(" ") ?? (status === "OK" ? "no direct stream URLs returned" : status);
     failures.push(`${client.name}: ${reason}`);
     if (status === "ERROR" && /unavailable|private|removed|terminated/i.test(reason)) {
@@ -159,14 +209,21 @@ async function fetchPlayer(videoId, env) {
     }
   }
   const joined = failures.join(" | ");
-  if (/sign in|bot|confirm you/i.test(joined)) {
+  if (transportOnly) {
     throw new ExtractionError(
-      "YouTube is blocking this server for this video. It checks whether requests come from a real device, and rejects most traffic from cloud hosting like Cloudflare. Other videos may still work.",
+      "YouTube is rate-limiting this server right now. Wait a few seconds and try again.",
+      503,
+      joined
+    );
+  }
+  if (/sign in|bot|confirm you/i.test(failures[0] ?? "")) {
+    throw new ExtractionError(
+      "YouTube wants a signed-in session for this particular video, so it cannot be fetched. Most other videos still work.",
       429,
       joined
     );
   }
-  throw new ExtractionError("No playable streams found.", 502, joined);
+  throw new ExtractionError("No playable streams found for this video.", 502, joined);
 }
 __name(fetchPlayer, "fetchPlayer");
 
@@ -318,7 +375,7 @@ function contentDisposition(filename, inline) {
 }
 __name(contentDisposition, "contentDisposition");
 async function streamFormat(opts, request, env) {
-  const { player } = await fetchPlayer(opts.videoId, env);
+  const { player, client } = await fetchPlayer(opts.videoId, env, { fresh: true });
   const fmt = findFormatUrl(player, opts.itag);
   if (!fmt?.url) {
     throw new ExtractionError(
@@ -330,19 +387,25 @@ async function streamFormat(opts, request, env) {
   const sub = mime.split("/")[1] ?? "mp4";
   const ext = mime.startsWith("audio/") && sub === "mp4" ? "m4a" : sub;
   const title = opts.filename ?? player.videoDetails?.title ?? opts.videoId;
+  const profile = CLIENTS.find((c) => c.name === client);
   const upstreamHeaders = {
-    "User-Agent": "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; en_US; Quest 3) gzip",
+    "User-Agent": profile?.userAgent ?? CLIENTS[0].userAgent,
     "Accept-Language": "en-US,en;q=0.9"
   };
   const range = request.headers.get("Range");
   if (range) upstreamHeaders.Range = range;
-  const upstream = await fetch(fmt.url, { headers: upstreamHeaders });
+  const upstream = await fetch(viaProxy(fmt.url, mediaProxyBase(env)), {
+    headers: upstreamHeaders
+  });
   if (!upstream.ok && upstream.status !== 206) {
-    throw new ExtractionError(
-      "The media host refused the download.",
-      502,
-      `HTTP ${upstream.status}`
-    );
+    let diagnostic = `HTTP ${upstream.status}`;
+    try {
+      const signedIp = new URL(fmt.url).searchParams.get("ip") ?? "?";
+      const egress = await fetch("https://api.ipify.org?format=json").then((r) => r.json()).then((j) => j.ip ?? "?").catch(() => "?");
+      diagnostic += ` | client=${client} | urlIp=${signedIp} | egressIp=${egress}`;
+    } catch {
+    }
+    throw new ExtractionError("The media host refused the download.", 502, diagnostic);
   }
   const headers = new Headers();
   headers.set("Content-Type", mime);
@@ -468,60 +531,198 @@ function parseResults(data, limit, excludeLive) {
   return items;
 }
 __name(parseResults, "parseResults");
-async function search(query, env, limit = 30, opts) {
+function findContinuation(node, depth = 0) {
+  if (depth > 30 || !node) return void 0;
+  if (Array.isArray(node)) {
+    for (const v of node) {
+      const t = findContinuation(v, depth + 1);
+      if (t) return t;
+    }
+    return void 0;
+  }
+  if (typeof node !== "object") return void 0;
+  const n = node;
+  const cc = n.continuationCommand;
+  if (cc && typeof cc.token === "string") return cc.token;
+  for (const v of Object.values(n)) {
+    const t = findContinuation(v, depth + 1);
+    if (t) return t;
+  }
+  return void 0;
+}
+__name(findContinuation, "findContinuation");
+async function searchFull(query, env, limit = 30, opts) {
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const data = await innertube("search", { query, params: FILTER_VIDEOS_ONLY }, env);
       const items = parseResults(data, limit, opts?.excludeLive);
-      if (items.length) return items;
+      if (items.length) {
+        return { items, continuation: findContinuation(data) };
+      }
     } catch (err) {
       lastErr = err;
     }
     if (attempt < 2) await new Promise((r) => setTimeout(r, 120 * (attempt + 1)));
   }
   if (lastErr) throw lastErr;
-  return [];
+  return { items: [] };
+}
+__name(searchFull, "searchFull");
+async function continueSearch(token, env, limit = 30, opts) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const data = await innertube("search", { continuation: token }, env);
+      const items = parseResults(data, limit, opts?.excludeLive);
+      if (items.length) {
+        return { items, continuation: findContinuation(data) };
+      }
+    } catch {
+    }
+    if (attempt < 1) await new Promise((r) => setTimeout(r, 150));
+  }
+  return { items: [] };
+}
+__name(continueSearch, "continueSearch");
+async function search(query, env, limit = 30, opts) {
+  return (await searchFull(query, env, limit, opts)).items;
 }
 __name(search, "search");
 var CATEGORIES = [
   // Queries lean towards produced, finished uploads. Broad terms like "news"
   // or "gaming" return mostly 24/7 live channels, which are filtered out and
   // would otherwise leave the grid nearly empty.
-  { id: "trending", label: "Trending", query: "most viewed videos this week" },
-  { id: "music", label: "Music", query: "official music video 2026" },
-  { id: "gaming", label: "Gaming", query: "gameplay walkthrough 2026" },
-  { id: "movies", label: "Movies", query: "official movie trailer 2026" },
-  { id: "news", label: "News", query: "news recap this week" },
-  { id: "sports", label: "Sports", query: "match highlights 2026" },
-  { id: "learning", label: "Learning", query: "documentary explained" },
-  { id: "podcasts", label: "Podcasts", query: "podcast full episode" }
+  {
+    id: "trending",
+    label: "Trending",
+    queries: [
+      "most viewed videos this week",
+      "trending videos 2026",
+      "viral video this month",
+      "popular videos right now",
+      "best videos this week"
+    ]
+  },
+  {
+    id: "music",
+    label: "Music",
+    queries: [
+      "official music video 2026",
+      "new songs 2026",
+      "top hits this month",
+      "official audio new release",
+      "live performance 2026"
+    ]
+  },
+  {
+    id: "gaming",
+    label: "Gaming",
+    queries: [
+      "gameplay walkthrough 2026",
+      "gaming moments compilation",
+      "new game review 2026",
+      "speedrun world record",
+      "best gaming clips"
+    ]
+  },
+  {
+    id: "movies",
+    label: "Movies",
+    queries: [
+      "official movie trailer 2026",
+      "new film trailer",
+      "movie clips scenes",
+      "behind the scenes film",
+      "short film award winning"
+    ]
+  },
+  {
+    id: "news",
+    label: "News",
+    queries: [
+      "news recap this week",
+      "world news explained",
+      "top stories this month",
+      "news analysis 2026",
+      "weekly news roundup"
+    ]
+  },
+  {
+    id: "sports",
+    label: "Sports",
+    queries: [
+      "match highlights 2026",
+      "best goals compilation",
+      "sports top plays",
+      "championship highlights",
+      "greatest moments sport"
+    ]
+  },
+  {
+    id: "learning",
+    label: "Learning",
+    queries: [
+      "documentary explained",
+      "how it works explained",
+      "science documentary 2026",
+      "history documentary",
+      "tutorial for beginners"
+    ]
+  },
+  {
+    id: "podcasts",
+    label: "Podcasts",
+    queries: [
+      "podcast full episode",
+      "interview podcast 2026",
+      "best podcast moments",
+      "long form interview",
+      "podcast highlights"
+    ]
+  }
 ];
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+__name(shuffle, "shuffle");
 async function feed(categoryId, env) {
   const cat = CATEGORIES.find((c) => c.id === categoryId) ?? CATEGORIES[0];
   const cacheKey = new Request(`https://feed.sagetube.internal/${cat.id}`);
   const cache = caches.default;
-  let items = [];
+  const query = cat.queries[Math.floor(Math.random() * cat.queries.length)];
+  let result = { items: [] };
   try {
-    items = await search(cat.query, env, 30, { excludeLive: true });
+    result = await searchFull(query, env, 30, { excludeLive: true });
   } catch {
-    items = [];
+    result = { items: [] };
   }
-  if (items.length) {
-    await cache.put(
-      cacheKey,
-      new Response(JSON.stringify(items), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "max-age=1800"
-        }
-      })
-    );
-    return items;
+  if (result.items.length) {
+    const out = { items: shuffle(result.items), continuation: result.continuation };
+    try {
+      await cache.put(
+        cacheKey,
+        new Response(JSON.stringify(out), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "max-age=1800"
+          }
+        })
+      );
+    } catch {
+    }
+    return out;
   }
   const stale = await cache.match(cacheKey);
-  if (stale) return await stale.json();
-  return [];
+  if (stale) {
+    const cached = await stale.json();
+    return { items: shuffle(cached.items ?? []), continuation: cached.continuation };
+  }
+  return { items: [] };
 }
 __name(feed, "feed");
 
@@ -674,9 +875,6 @@ function navHtml(active) {
       <span>${esc(c.label)}</span></a>`
   ).join("");
   return `
-    <button class="side-item install" id="installBtn" hidden>
-      <span>Install app</span>
-    </button>
     <a class="side-item${!active ? " active" : ""}" href="/"><span>Home</span></a>
     <div class="side-sep"></div>
     ${items}
@@ -768,6 +966,17 @@ ${jsonLd}
   <nav class="sidebar" id="sidebar" aria-label="Categories">${navHtml(o.activeNav)}</nav>
   <div class="scrim" id="scrim"></div>
   <main class="main" id="main">
+    <div class="install-banner" id="installBanner" hidden>
+      <span class="install-mark"><svg viewBox="0 0 24 24"><path d="M9 7l9 5-9 5z"/></svg></span>
+      <div class="install-copy">
+        <b>Install ${SITE_NAME}</b>
+        <span>Add it to your home screen for one-tap downloads, offline-ready.</span>
+      </div>
+      <button class="install-yes" id="installAccept">Install</button>
+      <button class="install-no" id="installDismiss" aria-label="Not now">
+        <svg viewBox="0 0 24 24"><path d="M19 6.4L17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg>
+      </button>
+    </div>
     ${chipsHtml(o.activeNav)}
     ${o.body}
   </main>
@@ -838,6 +1047,13 @@ function cardHtml(v, eager = false) {
 </article>`;
 }
 __name(cardHtml, "cardHtml");
+function sentinelHtml(continuation) {
+  if (!continuation) return "";
+  return `<div class="sentinel" id="feedSentinel" data-token="${esc(continuation)}">
+    <span class="spinner"></span><span>Loading more videos\u2026</span>
+  </div>`;
+}
+__name(sentinelHtml, "sentinelHtml");
 function gridHtml(items) {
   if (!items.length) {
     return `<div class="state"><h2>Nothing to show</h2><p>YouTube returned no results for this request. Try a different search or category.</p></div>`;
@@ -904,7 +1120,10 @@ function fmtDuration(totalSeconds) {
 __name(fmtDuration, "fmtDuration");
 async function homePage(origin, env, categoryId) {
   const cat = CATEGORIES.find((c) => c.id === categoryId);
-  const items = await feed(cat?.id ?? "trending", env).catch(() => []);
+  const { items, continuation } = await feed(cat?.id ?? "trending", env).catch(() => ({
+    items: [],
+    continuation: void 0
+  }));
   const heading = cat ? `${cat.label} videos to download` : `Download YouTube videos in MP4 and MP3`;
   const intro = cat ? `Browse ${cat.label.toLowerCase()} videos and save any of them as MP4 video or M4A/MP3 audio, in the quality you choose.` : `Search YouTube, preview any video, and download it as MP4 up to 4K or extract the audio as MP3. No app to install, no account, nothing uploaded to a server.`;
   const canonical = cat ? `${origin}/category/${cat.id}` : `${origin}/`;
@@ -914,6 +1133,7 @@ async function homePage(origin, env, categoryId) {
       <p>${esc(intro)}</p>
     </div>
     ${gridHtml(items)}
+    ${sentinelHtml(continuation)}
     ${cat ? "" : homeSeoProse()}`;
   return html(
     layout({
@@ -922,7 +1142,12 @@ async function homePage(origin, env, categoryId) {
       canonical,
       origin,
       activeNav: cat?.id,
-      initial: { page: cat ? "category" : "home", category: cat?.id ?? null, items },
+      initial: {
+        page: cat ? "category" : "home",
+        category: cat?.id ?? null,
+        items,
+        continuation
+      },
       body,
       jsonLd: [
         {
@@ -949,7 +1174,9 @@ async function homePage(origin, env, categoryId) {
           offers: { "@type": "Offer", price: "0", priceCurrency: "USD" }
         }
       ]
-    })
+    }),
+    200,
+    120
   );
 }
 __name(homePage, "homePage");
@@ -1121,13 +1348,14 @@ function landingPageHtml(page, origin) {
 }
 __name(landingPageHtml, "landingPageHtml");
 async function searchPage(q, origin, env) {
-  const items = q ? await search(q, env).catch(() => []) : [];
+  const { items, continuation } = q ? await searchFull(q, env).catch(() => ({ items: [], continuation: void 0 })) : { items: [], continuation: void 0 };
   const body = `
     <div class="page-head">
       <h1>${esc(q ? `Download videos for "${q}"` : "Search")}</h1>
       <p>${items.length} result${items.length === 1 ? "" : "s"}. Pick any video to choose a quality.</p>
     </div>
-    ${gridHtml(items)}`;
+    ${gridHtml(items)}
+    ${sentinelHtml(continuation)}`;
   return html(
     layout({
       title: `${q} - Download MP4 & MP3 | ${SITE_NAME}`,
@@ -1272,7 +1500,7 @@ async function sitemap(origin, env) {
       changefreq: "daily"
     }))
   ];
-  const trending = await feed("trending", env).catch(() => []);
+  const trending = (await feed("trending", env).catch(() => ({ items: [] }))).items;
   for (const v of trending.slice(0, 40)) {
     urls.push({ loc: `${origin}/watch/${v.id}`, priority: "0.7", changefreq: "weekly" });
   }
@@ -1367,7 +1595,17 @@ var src_default = {
           case "/api/categories":
             return json(CATEGORIES.map(({ id, label }) => ({ id, label })));
           case "/api/feed":
-            return json({ items: await feed(url.searchParams.get("category") ?? "trending", env) });
+            return json(await feed(url.searchParams.get("category") ?? "trending", env), 200, 60);
+          case "/api/more": {
+            const token = url.searchParams.get("token") ?? "";
+            if (!token) return json({ error: "Missing token." }, 400);
+            const live = url.searchParams.get("live") === "1";
+            return json(
+              await continueSearch(token, env, 30, { excludeLive: !live }),
+              200,
+              60
+            );
+          }
           case "/api/search": {
             const q = (url.searchParams.get("q") ?? "").trim();
             if (!q) return json({ error: "Empty search." }, 400);
@@ -1472,7 +1710,7 @@ var jsonError = /* @__PURE__ */ __name(async (request, env, _ctx, middlewareCtx)
 }, "jsonError");
 var middleware_miniflare3_json_error_default = jsonError;
 
-// .wrangler/tmp/bundle-sLilel/middleware-insertion-facade.js
+// .wrangler/tmp/bundle-X2j1Qw/middleware-insertion-facade.js
 var __INTERNAL_WRANGLER_MIDDLEWARE__ = [
   middleware_ensure_req_body_drained_default,
   middleware_miniflare3_json_error_default
@@ -1504,7 +1742,7 @@ function __facade_invoke__(request, env, ctx, dispatch, finalMiddleware) {
 }
 __name(__facade_invoke__, "__facade_invoke__");
 
-// .wrangler/tmp/bundle-sLilel/middleware-loader.entry.ts
+// .wrangler/tmp/bundle-X2j1Qw/middleware-loader.entry.ts
 var __Facade_ScheduledController__ = class ___Facade_ScheduledController__ {
   constructor(scheduledTime, cron, noRetry) {
     this.scheduledTime = scheduledTime;

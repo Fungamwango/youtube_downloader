@@ -101,13 +101,63 @@
   var dlBadge = $("#dlBadge");
   var clearDone = $("#clearDone");
 
-  function openDrawer() { if (drawer) drawer.hidden = false; }
+  /* --------------------------------------------------- modal back button */
+
+  /* Opening a dialog pushes a history entry, so the phone's Back gesture (and
+     the browser's back button) dismisses the dialog instead of leaving the
+     page. Closing by any other route pops that entry again, so history never
+     accumulates dead entries. */
+  var modalStack = [];
+
+  function pushModal(name, onClose) {
+    modalStack.push({ name: name, close: onClose });
+    try {
+      history.pushState({ sagetubeModal: name }, "");
+    } catch (e) {
+      // Private modes can throw; the dialog still works, Back just navigates.
+    }
+  }
+
+  function closeTopModal(fromPopstate) {
+    var top = modalStack.pop();
+    if (!top) return;
+    top.close();
+    // When the user pressed Back, the entry is already gone.
+    if (!fromPopstate) {
+      try {
+        history.back();
+      } catch (e) {}
+    }
+  }
+
+  window.addEventListener("popstate", function () {
+    if (modalStack.length) closeTopModal(true);
+  });
+
+  function isTopModal(name) {
+    return modalStack.length && modalStack[modalStack.length - 1].name === name;
+  }
+
+  /* ------------------------------------------------------ drawer control */
+
+  function hideDrawerUI() { if (drawer) drawer.hidden = true; }
+
+  function openDrawer() {
+    if (!drawer || !drawer.hidden) return; // already open: don't stack entries
+    drawer.hidden = false;
+    pushModal("drawer", hideDrawerUI);
+  }
+
+  function closeDrawer() {
+    if (!drawer || drawer.hidden) return;
+    if (isTopModal("drawer")) closeTopModal(false);
+    else hideDrawerUI();
+  }
+
   var downloadsBtn = $("#downloadsBtn");
   if (downloadsBtn) downloadsBtn.addEventListener("click", openDrawer);
   var drawerClose = $("#drawerClose");
-  if (drawerClose) {
-    drawerClose.addEventListener("click", function () { drawer.hidden = true; });
-  }
+  if (drawerClose) drawerClose.addEventListener("click", closeDrawer);
   if (clearDone) {
     clearDone.addEventListener("click", function () {
       jobs = jobs.filter(function (j) { return j.state === "running"; });
@@ -325,8 +375,16 @@
 
   /* -------------------------------------------------------- ffmpeg (lazy) */
 
-  var FF_VER = "0.12.10";
-  var FF_CORE = "0.12.6";
+  /* The loader files are served from this origin (/vendor/), which keeps the
+     ffmpeg worker same-origin. Pulling the FFmpeg class from a CDN instead
+     forces a cross-origin blob-worker bootstrap that fails on some browsers
+     and rejects with a non-Error carrying no .message - the cause of the
+     "(undefined)" failure this replaced.
+
+     Only the core wasm stays remote: it is 32 MB and Cloudflare's static
+     asset limit is 25 MiB per file, so it cannot be served from here. */
+  var FF_WASM_URL =
+    "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm";
   var ffmpegPromise = null;
   var ffProgressTarget = null;
 
@@ -340,48 +398,65 @@
     });
   }
 
-  /**
-   * ffmpeg.wasm is ~32 MB, so it is only fetched the first time a merge or an
-   * MP3 conversion is requested. Loading from a CDN requires the worker and
-   * core to become blob URLs first, or the worker bootstrap is blocked as
-   * cross-origin.
-   */
-  function getFFmpeg(onStatus) {
-    if (ffmpegPromise) return ffmpegPromise;
-    ffmpegPromise = (function () {
-      if (onStatus) onStatus();
-      var base = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@" + FF_VER + "/dist/umd";
-      var coreBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@" + FF_CORE + "/dist/umd";
-      var utilBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd";
+  /** Failures here are often ErrorEvents or bare strings rather than Errors. */
+  function describeError(err) {
+    if (!err) return "no details available";
+    if (typeof err === "string") return err;
+    if (err.message) return err.message;
+    if (err.type) return "worker error: " + err.type;
+    try {
+      return JSON.stringify(err).slice(0, 200);
+    } catch (e) {
+      return String(err);
+    }
+  }
 
-      return loadScript(base + "/ffmpeg.js")
-        .then(function () { return loadScript(utilBase + "/index.js"); })
-        .then(function () {
-          var toBlobURL = window.FFmpegUtil.toBlobURL;
-          return Promise.all([
-            toBlobURL(base + "/814.ffmpeg.js", "text/javascript"),
-            toBlobURL(coreBase + "/ffmpeg-core.js", "text/javascript"),
-            toBlobURL(coreBase + "/ffmpeg-core.wasm", "application/wasm"),
-          ]);
-        })
-        .then(function (urls) {
-          var ff = new window.FFmpegWASM.FFmpeg();
-          // One shared instance, so progress is routed to whichever job owns it.
-          ff.on("progress", function (e) {
-            if (ffProgressTarget) ffProgressTarget(e && e.progress ? e.progress : 0);
-          });
-          return ff
-            .load({ classWorkerURL: urls[0], coreURL: urls[1], wasmURL: urls[2] })
-            .then(function () { return ff; });
-        })
-        .catch(function (err) {
-          ffmpegPromise = null;
-          throw new Error(
-            "The in-browser media engine failed to load. You can still use the " +
-              "Direct qualities. (" + err.message + ")"
-          );
+  /**
+   * Loaded lazily: nothing here is fetched until a merge or MP3 conversion is
+   * actually requested. `onStage(label, progress, indeterminate)` matches a
+   * job handle's .stage(), so callers can pass theirs straight in.
+   */
+  function getFFmpeg(onStage) {
+    if (ffmpegPromise) return ffmpegPromise;
+    var stage = onStage || function () {};
+    var LOADING = "Downloading the media engine (one time, 32 MB)…";
+
+    ffmpegPromise = loadScript("/vendor/ffmpeg.js")
+      .then(function () {
+        if (!window.FFmpegWASM || !window.FFmpegWASM.FFmpeg) {
+          throw new Error("ffmpeg.js loaded but registered no FFmpeg class");
+        }
+        stage(LOADING, 0.02, false);
+        // Fetched by hand rather than by ffmpeg so the 32 MB has a real
+        // progress bar instead of an indeterminate spinner.
+        return fetchWithProgress(FF_WASM_URL, function (received, total) {
+          var p = total ? received / total : 0;
+          stage(LOADING, 0.02 + p * 0.5, !total);
         });
-    })();
+      })
+      .then(function (bytes) {
+        stage("Starting the media engine…", 0.55, true);
+        var wasmUrl = URL.createObjectURL(
+          new Blob([bytes], { type: "application/wasm" })
+        );
+        var ff = new window.FFmpegWASM.FFmpeg();
+        // One shared instance, so progress routes to whichever job owns it.
+        ff.on("progress", function (e) {
+          if (ffProgressTarget) ffProgressTarget(e && e.progress ? e.progress : 0);
+        });
+        return ff
+          .load({ coreURL: "/vendor/ffmpeg-core.js", wasmURL: wasmUrl })
+          .then(function () { return ff; });
+      })
+      .catch(function (err) {
+        ffmpegPromise = null; // so the next attempt starts clean
+        throw new Error(
+          "The in-browser media engine failed to load, so merged and MP3 " +
+            "downloads are unavailable. Direct qualities still work. (" +
+            describeError(err) + ")"
+        );
+      });
+
     return ffmpegPromise;
   }
 
@@ -463,9 +538,7 @@
     job.attach(ctl);
 
     var ff;
-    return getFFmpeg(function () {
-      job.stage("Loading the media engine (one time, ~32 MB)…", 0.02, true);
-    })
+    return getFFmpeg(job.stage)
       .then(function (instance) {
         ff = instance;
         job.stage("Downloading video…", 0.05);
@@ -553,9 +626,7 @@
     job.attach(ctl);
 
     var ff;
-    return getFFmpeg(function () {
-      job.stage("Loading the media engine (one time, ~32 MB)…", 0.02, true);
-    })
+    return getFFmpeg(job.stage)
       .then(function (instance) {
         ff = instance;
         job.stage("Downloading audio…", 0.1);
@@ -695,7 +766,13 @@
   var sheetWrap = $("#sheetWrap");
   var sheetBody = $("#sheetBody");
 
-  function closeSheet() { if (sheetWrap) sheetWrap.hidden = true; }
+  function hideSheetUI() { if (sheetWrap) sheetWrap.hidden = true; }
+
+  function closeSheet() {
+    if (!sheetWrap || sheetWrap.hidden) return;
+    if (isTopModal("sheet")) closeTopModal(false);
+    else hideSheetUI();
+  }
   if (sheetWrap) {
     sheetWrap.addEventListener("click", function (e) {
       if (e.target.hasAttribute("data-close") || e.target.closest("[data-close]")) closeSheet();
@@ -766,7 +843,10 @@
   var sheetTabsBound = false;
   function openSheet(videoId, title) {
     if (!sheetWrap) return;
-    sheetWrap.hidden = false;
+    if (sheetWrap.hidden) {
+      sheetWrap.hidden = false;
+      pushModal("sheet", hideSheetUI);
+    }
     $("#sheetTitle").textContent = title || "Loading…";
     $("#sheetSub").textContent = "";
     $("#sheetThumb").src = "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg";
@@ -802,6 +882,101 @@
     openSheet(btn.getAttribute("data-dl"), card ? card.getAttribute("data-title") : "");
   });
 
+  /* --------------------------------------------------- infinite scroll */
+
+  var DL_ICON =
+    '<svg viewBox="0 0 24 24"><path d="M12 3v10.6l3.3-3.3 1.4 1.4L12 17.4l-4.7-5.7 1.4-1.4L12 13.6V3zM5 19h14v2H5z"/></svg>';
+
+  /** Mirrors cardHtml() in render.ts so appended cards match the rendered ones. */
+  function cardMarkup(v) {
+    var dur = v.live
+      ? '<span class="dur live">LIVE</span>'
+      : v.duration
+        ? '<span class="dur">' + escapeHtml(v.duration) + "</span>"
+        : "";
+    var sub = [v.views, v.published].filter(Boolean).map(escapeHtml).join(" &middot; ");
+    var id = escapeHtml(v.id);
+    var title = escapeHtml(v.title);
+    return (
+      '<article class="card" data-id="' + id + '" data-title="' + title + '">' +
+      '<a class="thumb-wrap" href="/watch/' + id + '" aria-label="' + title + '">' +
+      '<img src="' + escapeHtml(v.thumbnail) + '" alt="' + title + '"' +
+      ' width="480" height="270" loading="lazy" decoding="async" />' + dur + "</a>" +
+      '<div class="card-body"><div class="card-text">' +
+      '<h3 class="card-title"><a href="/watch/' + id + '">' + title + "</a></h3>" +
+      '<p class="card-sub">' + escapeHtml(v.channel) + "</p>" +
+      '<p class="card-sub">' + sub + "</p></div>" +
+      '<button class="dl-btn" data-dl="' + id + '" aria-label="Download ' + title + '">' +
+      DL_ICON + "<span>Get</span></button></div></article>"
+    );
+  }
+
+  (function initInfiniteScroll() {
+    var grid = $("#grid");
+    var sentinel = $("#feedSentinel");
+    if (!grid || !sentinel || !("IntersectionObserver" in window)) return;
+
+    // Seed from what the server rendered so later pages cannot duplicate cards.
+    var seen = {};
+    $$("[data-id]", grid).forEach(function (el) {
+      seen[el.getAttribute("data-id")] = true;
+    });
+
+    var busy = false;
+    var emptyRuns = 0;
+
+    function stop(message) {
+      observer.disconnect();
+      if (message) sentinel.innerHTML = "<span>" + escapeHtml(message) + "</span>";
+      else sentinel.remove();
+    }
+
+    function loadMore() {
+      var token = sentinel.getAttribute("data-token");
+      if (!token || busy) return;
+      busy = true;
+
+      fetch("/api/more?token=" + encodeURIComponent(token))
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.error) throw new Error(d.error);
+          var added = 0;
+          (d.items || []).forEach(function (v) {
+            if (!v || !v.id || seen[v.id]) return;
+            seen[v.id] = true;
+            grid.insertAdjacentHTML("beforeend", cardMarkup(v));
+            added++;
+          });
+
+          if (!d.continuation) {
+            stop(added ? null : "That's everything.");
+            return;
+          }
+          sentinel.setAttribute("data-token", d.continuation);
+          busy = false;
+
+          // A page can legitimately be all duplicates (or all live streams,
+          // which are filtered out). Pull the next one rather than stalling,
+          // but give up after a few so this cannot spin forever.
+          emptyRuns = added ? 0 : emptyRuns + 1;
+          if (added === 0 && emptyRuns < 4) loadMore();
+        })
+        .catch(function () {
+          busy = false;
+          sentinel.innerHTML = "<span>Could not load more. Scroll to retry.</span>";
+        });
+    }
+
+    var observer = new IntersectionObserver(
+      function (entries) {
+        if (entries[0] && entries[0].isIntersecting) loadMore();
+      },
+      // Start fetching before the sentinel is actually on screen.
+      { rootMargin: "800px 0px" }
+    );
+    observer.observe(sentinel);
+  })();
+
   /* ------------------------------------------------------- fixed zoom */
 
   /* iOS Safari has ignored user-scalable=no since iOS 10, so pinch-zoom has to
@@ -832,31 +1007,54 @@
   // Chrome/Edge fire this instead of showing their own prompt, so the button
   // stays hidden until the browser confirms the app is actually installable.
   var deferredPrompt = null;
-  var installBtn = $("#installBtn");
+  var banner = $("#installBanner");
+  var DISMISS_KEY = "sagetube.installDismissed";
+
+  function dismissedRecently() {
+    try {
+      var until = Number(localStorage.getItem(DISMISS_KEY) || 0);
+      return until > Date.now();
+    } catch (e) {
+      return false; // storage blocked: just show the banner
+    }
+  }
+
+  function hideBanner() { if (banner) banner.hidden = true; }
 
   window.addEventListener("beforeinstallprompt", function (e) {
+    // Chrome/Edge fire this only when the app is genuinely installable, so the
+    // banner never appears where it could not do anything.
     e.preventDefault();
     deferredPrompt = e;
-    if (installBtn) installBtn.hidden = false;
+    if (banner && !dismissedRecently()) banner.hidden = false;
   });
 
-  if (installBtn) {
-    installBtn.addEventListener("click", function () {
-      if (!deferredPrompt) return;
+  var installAccept = $("#installAccept");
+  if (installAccept) {
+    installAccept.addEventListener("click", function () {
+      if (!deferredPrompt) return hideBanner();
       deferredPrompt.prompt();
       deferredPrompt.userChoice.then(function (choice) {
-        if (choice && choice.outcome === "accepted") {
-          installBtn.hidden = true;
-          toast("Installing SageTube…");
-        }
+        if (choice && choice.outcome === "accepted") hideBanner();
         deferredPrompt = null;
       });
     });
   }
 
+  var installDismiss = $("#installDismiss");
+  if (installDismiss) {
+    installDismiss.addEventListener("click", function () {
+      hideBanner();
+      // Stay out of the way for a fortnight rather than nagging every visit.
+      try {
+        localStorage.setItem(DISMISS_KEY, String(Date.now() + 14 * 864e5));
+      } catch (e) {}
+    });
+  }
+
   window.addEventListener("appinstalled", function () {
     deferredPrompt = null;
-    if (installBtn) installBtn.hidden = true;
+    hideBanner();
     toast("SageTube installed.");
   });
 

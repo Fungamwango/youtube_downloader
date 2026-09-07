@@ -130,7 +130,78 @@ npm run deploy
 
 ## Known limitations
 
-### Extraction is IP-blocked from Cloudflare (the big one)
+### Downloads are IP-blocked from Cloudflare (the big one)
+
+**Symptom:** metadata and quality lists load fine, but pressing a quality gives
+"The media host refused the download". Measured on the deployed Worker:
+extraction **8/8**, downloads **1/8**.
+
+**Cause.** googlevideo signs the requesting IP into every stream URL — `ip`
+appears in the URL's own `sparams` list, so it is covered by the signature and
+cannot be edited out. The download therefore only succeeds when the media
+request leaves from the same address that minted the URL.
+
+From a Worker that is impossible. Instrumenting a failure shows:
+
+```
+HTTP 403 | client=IOS | urlIp=172.69.170.138 | egressIp=2a06:98c0:3600::103
+```
+
+Cloudflare reaches `www.youtube.com` over **IPv4** and `googlevideo.com` over
+**IPv6**, so the minting address and the fetching address never match. Which
+videos survive it is decided by a per-video protection flag: failing URLs carry
+an extra `pcm2` sparam that tolerant ones do not.
+
+Things tested and ruled out, so they are not retried:
+
+- **Minting via `youtubei.googleapis.com`** instead of `www.youtube.com` — the
+  player call still egresses IPv4. No change.
+- **`X-Forwarded-For`** set to the Worker's IPv6 egress, to make YouTube mint
+  against the address googlevideo would see — the signed `ip` came back
+  unchanged. YouTube ignores it.
+- **A client whose URLs are not IP-bound** — all of IOS, ANDROID, ANDROID_VR
+  and TVHTML5 list `ip` in `sparams`.
+- **Caching the player response** — actively harmful, and briefly shipped: a
+  cached URL was minted by a different request, so it 403s. `fetchPlayer` now
+  takes `fresh: true` for downloads for exactly this reason.
+
+**The fix is `relay/server.mjs`** — see "Fixing downloads" below. Routing both
+halves through one machine gave 5/5 downloads on videos that fail 0/4 on
+Cloudflare.
+
+### Fixing downloads with the relay
+
+The relay performs both the InnerTube mint and the media fetch from one
+address, so the signature matches. The Worker stays the public site.
+
+```bash
+# 1. On any machine with a normal connection (home PC, Pi, VPS):
+TOKEN=pick-a-secret node relay/server.mjs
+
+# 2. Expose it - no port forwarding or static IP needed:
+cloudflared tunnel --url http://localhost:8789
+
+# 3. Point the Worker at it (both vars, same machine):
+npx wrangler secret put YT_PROXY_URL
+#   https://<tunnel>.trycloudflare.com/fetch?token=pick-a-secret&url={url}
+npx wrangler secret put YT_MEDIA_PROXY_URL
+#   https://<tunnel>.trycloudflare.com/fetch?token=pick-a-secret&url={url}
+```
+
+Both vars must point at the **same** machine — proxying only the metadata call
+makes things worse, because the URL would then be signed for the relay while
+the media still left from Cloudflare.
+
+The relay requires Node 18+, refuses any host outside YouTube/googlevideo (so
+it cannot be turned into an open proxy or aimed at your LAN), and requires
+`TOKEN` if you set one. All media is streamed, never buffered.
+
+### Extraction (resolved)
+
+Extraction itself now succeeds 8/8. It previously failed for most videos, and
+the fix was reordering the client list — see the client table above. The notes
+below are kept because the failure mode recurs whenever YouTube retires a
+client version.
 
 YouTube rejects most InnerTube player requests coming from cloud hosting with
 `LOGIN_REQUIRED` — "Sign in to confirm you're not a bot". Measured on the

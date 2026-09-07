@@ -66,9 +66,6 @@ function navHtml(active?: string): string {
       <span>${esc(c.label)}</span></a>`,
   ).join("");
   return `
-    <button class="side-item install" id="installBtn" hidden>
-      <span>Install app</span>
-    </button>
     <a class="side-item${!active ? " active" : ""}" href="/"><span>Home</span></a>
     <div class="side-sep"></div>
     ${items}
@@ -164,6 +161,17 @@ ${jsonLd}
   <nav class="sidebar" id="sidebar" aria-label="Categories">${navHtml(o.activeNav)}</nav>
   <div class="scrim" id="scrim"></div>
   <main class="main" id="main">
+    <div class="install-banner" id="installBanner" hidden>
+      <span class="install-mark"><svg viewBox="0 0 24 24"><path d="M9 7l9 5-9 5z"/></svg></span>
+      <div class="install-copy">
+        <b>Install ${SITE_NAME}</b>
+        <span>Add it to your home screen for one-tap downloads, offline-ready.</span>
+      </div>
+      <button class="install-yes" id="installAccept">Install</button>
+      <button class="install-no" id="installDismiss" aria-label="Not now">
+        <svg viewBox="0 0 24 24"><path d="M19 6.4L17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg>
+      </button>
+    </div>
     ${chipsHtml(o.activeNav)}
     ${o.body}
   </main>
@@ -237,6 +245,18 @@ export function cardHtml(v: FeedItem, eager = false): string {
     </button>
   </div>
 </article>`;
+}
+
+/**
+ * Anchor for infinite scroll. Carries the continuation token; app.js watches it
+ * with an IntersectionObserver and appends the next page when it comes into
+ * view. Rendered only when YouTube actually offered a next page.
+ */
+export function sentinelHtml(continuation?: string): string {
+  if (!continuation) return "";
+  return `<div class="sentinel" id="feedSentinel" data-token="${esc(continuation)}">
+    <span class="spinner"></span><span>Loading more videos…</span>
+  </div>`;
 }
 
 export function gridHtml(items: FeedItem[]): string {

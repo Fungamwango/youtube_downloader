@@ -1,0 +1,23 @@
+# Fly.io config for the SageTube relay.
+#   fly launch --no-deploy --copy-config --name sagetube-relay
+#   fly secrets set TOKEN=<your-secret>
+#   fly deploy
+app = "sagetube-relay"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep one machine warm. A cold start would stall the first download, and a
+  # restart can change the egress IP mid-request, which is exactly the failure
+  # this relay exists to avoid.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

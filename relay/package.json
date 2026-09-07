@@ -1,0 +1,13 @@
+{
+  "name": "sagetube-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mints and fetches YouTube media from one IP so googlevideo's IP-signed URLs validate.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

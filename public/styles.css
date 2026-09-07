@@ -467,6 +467,76 @@ body.nav-open .scrim { display: block; }
   .hero-box button { width: 100%; }
 }
 
+/* ---------- install prompt banner ---------- */
+.install-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border: 1px solid #3a2a2f;
+  border-radius: var(--radius);
+  background: linear-gradient(90deg, rgba(255,0,51,.14), rgba(255,0,51,.04));
+}
+.install-mark {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 38px; height: 38px;
+  background: var(--accent);
+  border-radius: 10px;
+}
+.install-mark svg { width: 20px; height: 20px; fill: #fff; }
+.install-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.install-copy b { font-size: 14px; }
+.install-copy span { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; }
+.install-yes {
+  flex: 0 0 auto;
+  height: 36px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 18px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.install-yes:hover { background: var(--accent-hover); }
+.install-no {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 34px; height: 34px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.install-no:hover { background: var(--bg-hover); color: var(--text); }
+.install-no svg { width: 18px; height: 18px; }
+
+@media (max-width: 560px) {
+  .install-banner { flex-wrap: wrap; gap: 10px; }
+  .install-copy { flex-basis: 100%; order: 2; }
+  .install-copy span { display: none; }
+  .install-yes { order: 3; flex: 1; }
+  .install-mark { order: 1; }
+  .install-no { order: 1; margin-left: auto; }
+}
+
+/* ---------- infinite scroll sentinel ---------- */
+.sentinel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 34px 16px 12px;
+  color: var(--text-dim);
+  font-size: 13.5px;
+}
+
 /* ---------- SEO prose blocks ---------- */
 .seo { max-width: 780px; margin: 48px auto 0; padding-top: 32px; border-top: 1px solid var(--border); }
 .seo h2 { font-size: 17px; margin: 0 0 10px; }
@@ -490,11 +560,27 @@ body.nav-open .scrim { display: block; }
   .main { margin-left: 0; padding: 0 16px 64px; }
 }
 @media (max-width: 640px) {
-  .topbar { padding: 0 8px; gap: 4px; }
+  /* The top bar is menu + brand + search + downloads on one row. Everything
+     fixed-width shrinks so the search field keeps a usable share of a narrow
+     screen instead of being squeezed to a sliver. */
+  .topbar { padding: 0 6px; gap: 2px; }
   .brand-text { display: none; }
-  .searchbar { max-width: none; }
-  .search-go { width: 48px; }
+  .brand { margin-right: 2px; }
+  .icon-btn { width: 38px; height: 38px; }
+  .searchbar { max-width: none; min-width: 0; }
+  .searchbar input { padding: 0 12px; }
+  .search-go { width: 46px; }
   .grid { grid-template-columns: 1fr; }
   .sheet { width: 100vw; max-height: 88vh; border-radius: 16px 16px 0 0; align-self: end; }
   .sheet-wrap { place-items: end center; }
+}
+
+/* Very narrow phones: drop the logo entirely so search gets the room. */
+@media (max-width: 400px) {
+  .brand { display: none; }
+  .icon-btn { width: 36px; height: 36px; }
+  .searchbar { height: 38px; }
+  .searchbar input { padding: 0 10px; }
+  .search-go { width: 42px; }
+  .search-go svg { width: 20px; height: 20px; }
 }

@@ -9,12 +9,13 @@
 import { fetchPlayer, parseVideoId, ExtractionError } from "./innertube";
 import { extractFormats } from "./formats";
 import { streamFormat } from "./stream";
-import { search, feed, CATEGORIES } from "./search";
+import { search, searchFull, continueSearch, feed, CATEGORIES } from "./search";
 import { LANDING_PAGES, findLanding, type LandingPage } from "./landing";
 import {
   layout,
   gridHtml,
   cardHtml,
+  sentinelHtml,
   formatTableHtml,
   esc,
   isoDuration,
@@ -24,7 +25,10 @@ import {
 
 export interface Env {
   ASSETS: Fetcher;
+  /** Relay for InnerTube calls. See README "Extraction is IP-blocked". */
   YT_PROXY_URL?: string;
+  /** Relay for googlevideo media. Must share an IP with YT_PROXY_URL. */
+  YT_MEDIA_PROXY_URL?: string;
 }
 
 /* ------------------------------------------------------------------ utils */
@@ -63,7 +67,10 @@ function fmtDuration(totalSeconds: number): string {
 
 async function homePage(origin: string, env: Env, categoryId?: string) {
   const cat = CATEGORIES.find((c) => c.id === categoryId);
-  const items = await feed(cat?.id ?? "trending", env).catch(() => []);
+  const { items, continuation } = await feed(cat?.id ?? "trending", env).catch(() => ({
+    items: [],
+    continuation: undefined,
+  }));
 
   const heading = cat
     ? `${cat.label} videos to download`
@@ -80,8 +87,11 @@ async function homePage(origin: string, env: Env, categoryId?: string) {
       <p>${esc(intro)}</p>
     </div>
     ${gridHtml(items)}
+    ${sentinelHtml(continuation)}
     ${cat ? "" : homeSeoProse()}`;
 
+  // Short edge cache: these grids are randomised per request, so caching them
+  // for long would hand every visitor the same "random" page for ten minutes.
   return html(
     layout({
       title: cat
@@ -91,7 +101,12 @@ async function homePage(origin: string, env: Env, categoryId?: string) {
       canonical,
       origin,
       activeNav: cat?.id,
-      initial: { page: cat ? "category" : "home", category: cat?.id ?? null, items },
+      initial: {
+        page: cat ? "category" : "home",
+        category: cat?.id ?? null,
+        items,
+        continuation,
+      },
       body,
       jsonLd: [
         {
@@ -119,6 +134,8 @@ async function homePage(origin: string, env: Env, categoryId?: string) {
         },
       ],
     }),
+    200,
+    120,
   );
 }
 
@@ -306,13 +323,16 @@ function landingPageHtml(page: LandingPage, origin: string) {
 }
 
 async function searchPage(q: string, origin: string, env: Env) {
-  const items = q ? await search(q, env).catch(() => []) : [];
+  const { items, continuation } = q
+    ? await searchFull(q, env).catch(() => ({ items: [], continuation: undefined }))
+    : { items: [], continuation: undefined };
   const body = `
     <div class="page-head">
       <h1>${esc(q ? `Download videos for "${q}"` : "Search")}</h1>
       <p>${items.length} result${items.length === 1 ? "" : "s"}. Pick any video to choose a quality.</p>
     </div>
-    ${gridHtml(items)}`;
+    ${gridHtml(items)}
+    ${sentinelHtml(continuation)}`;
 
   return html(
     layout({
@@ -469,7 +489,7 @@ async function sitemap(origin: string, env: Env) {
   ];
 
   // Include currently trending videos so there are real watch URLs to crawl.
-  const trending = await feed("trending", env).catch(() => []);
+  const trending = (await feed("trending", env).catch(() => ({ items: [] }))).items;
   for (const v of trending.slice(0, 40)) {
     urls.push({ loc: `${origin}/watch/${v.id}`, priority: "0.7", changefreq: "weekly" });
   }
@@ -584,7 +604,20 @@ export default {
           case "/api/categories":
             return json(CATEGORIES.map(({ id, label }) => ({ id, label })));
           case "/api/feed":
-            return json({ items: await feed(url.searchParams.get("category") ?? "trending", env) });
+            return json(await feed(url.searchParams.get("category") ?? "trending", env), 200, 60);
+
+          case "/api/more": {
+            // Next page for infinite scroll. The token encodes the original
+            // query, so nothing else needs to be passed back.
+            const token = url.searchParams.get("token") ?? "";
+            if (!token) return json({ error: "Missing token." }, 400);
+            const live = url.searchParams.get("live") === "1";
+            return json(
+              await continueSearch(token, env, 30, { excludeLive: !live }),
+              200,
+              60,
+            );
+          }
           case "/api/search": {
             const q = (url.searchParams.get("q") ?? "").trim();
             if (!q) return json({ error: "Empty search." }, 400);

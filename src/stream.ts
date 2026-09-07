@@ -10,7 +10,13 @@
  * so memory stays flat regardless of whether it is a 3 MB song or a 4K movie.
  */
 
-import { fetchPlayer, ExtractionError } from "./innertube";
+import {
+  fetchPlayer,
+  ExtractionError,
+  CLIENTS,
+  viaProxy,
+  mediaProxyBase,
+} from "./innertube";
 import { findFormatUrl } from "./formats";
 
 /** Strips characters Windows/macOS reject in filenames. */
@@ -42,9 +48,11 @@ export interface StreamOptions {
 export async function streamFormat(
   opts: StreamOptions,
   request: Request,
-  env: { YT_PROXY_URL?: string },
+  env: { YT_PROXY_URL?: string; YT_MEDIA_PROXY_URL?: string },
 ): Promise<Response> {
-  const { player } = await fetchPlayer(opts.videoId, env);
+  // fresh:true is required — see fetchPlayer. A cached player response carries
+  // URLs minted for a different request's IP, which googlevideo answers with 403.
+  const { player, client } = await fetchPlayer(opts.videoId, env, { fresh: true });
   const fmt = findFormatUrl(player, opts.itag);
   if (!fmt?.url) {
     throw new ExtractionError(
@@ -60,21 +68,37 @@ export async function streamFormat(
 
   // Forward Range verbatim so browsers can resume and seek. googlevideo
   // honours it; without it, large downloads cannot be resumed.
+  // googlevideo checks that the caller looks like the client the URL was minted
+  // for. The client varies per request (IOS or ANDROID_VR, whichever answers
+  // first), so the UA has to be looked up rather than hardcoded — a fixed UA
+  // gets a refusal whenever the other client happens to mint the URL.
+  const profile = CLIENTS.find((c) => c.name === client);
   const upstreamHeaders: Record<string, string> = {
-    "User-Agent":
-      "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; en_US; Quest 3) gzip",
+    "User-Agent": profile?.userAgent ?? CLIENTS[0].userAgent,
     "Accept-Language": "en-US,en;q=0.9",
   };
   const range = request.headers.get("Range");
   if (range) upstreamHeaders.Range = range;
 
-  const upstream = await fetch(fmt.url, { headers: upstreamHeaders });
+  const upstream = await fetch(viaProxy(fmt.url, mediaProxyBase(env)), {
+    headers: upstreamHeaders,
+  });
   if (!upstream.ok && upstream.status !== 206) {
-    throw new ExtractionError(
-      "The media host refused the download.",
-      502,
-      `HTTP ${upstream.status}`,
-    );
+    // googlevideo signs the minting IP into the URL (it appears in `sparams`),
+    // so a 403 usually means the egress IP moved between minting the URL and
+    // fetching it. Report both so that is visible rather than guessed at.
+    let diagnostic = `HTTP ${upstream.status}`;
+    try {
+      const signedIp = new URL(fmt.url).searchParams.get("ip") ?? "?";
+      const egress = await fetch("https://api.ipify.org?format=json")
+        .then((r) => r.json() as Promise<{ ip?: string }>)
+        .then((j) => j.ip ?? "?")
+        .catch(() => "?");
+      diagnostic += ` | client=${client} | urlIp=${signedIp} | egressIp=${egress}`;
+    } catch {
+      // Diagnostics are best-effort.
+    }
+    throw new ExtractionError("The media host refused the download.", 502, diagnostic);
   }
 
   const headers = new Headers();

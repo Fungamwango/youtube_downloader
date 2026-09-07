@@ -87,12 +87,38 @@ export const CLIENTS: ClientProfile[] = [
  *   - a reverse-proxy origin that mirrors youtube.com's paths, e.g.
  *     https://yt.example.com  ->  https://yt.example.com/youtubei/v1/player?...
  */
-export function proxied(targetUrl: string, env: { YT_PROXY_URL?: string }): string {
-  const base = (env.YT_PROXY_URL ?? "").trim();
-  if (!base) return targetUrl;
-  if (base.includes("{url}")) return base.replace("{url}", encodeURIComponent(targetUrl));
+export function viaProxy(targetUrl: string, base?: string): string {
+  const b = (base ?? "").trim();
+  if (!b) return targetUrl;
+  if (b.includes("{url}")) return b.replace("{url}", encodeURIComponent(targetUrl));
   const u = new URL(targetUrl);
-  return base.replace(/\/$/, "") + u.pathname + u.search;
+  return b.replace(/\/$/, "") + u.pathname + u.search;
+}
+
+export function proxied(targetUrl: string, env: { YT_PROXY_URL?: string }): string {
+  return viaProxy(targetUrl, env.YT_PROXY_URL);
+}
+
+/**
+ * Picks the proxy for media (googlevideo) requests.
+ *
+ * googlevideo signs the minting IP into the stream URL, so a download only
+ * succeeds when it leaves from the same address that minted it. Proxying only
+ * the InnerTube call makes that worse, not better — the URL would be signed for
+ * the relay while the media still left from Cloudflare. Both have to go through
+ * the same relay.
+ *
+ * Only a {url}-template proxy can carry media, because a path-mirroring base
+ * cannot express arbitrary googlevideo hostnames.
+ */
+export function mediaProxyBase(env: {
+  YT_PROXY_URL?: string;
+  YT_MEDIA_PROXY_URL?: string;
+}): string | undefined {
+  const explicit = (env.YT_MEDIA_PROXY_URL ?? "").trim();
+  if (explicit) return explicit;
+  const shared = (env.YT_PROXY_URL ?? "").trim();
+  return shared.includes("{url}") ? shared : undefined;
 }
 
 const INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
@@ -213,18 +239,19 @@ async function callPlayer(
 
   const target = proxied(PLAYER_URL, env);
 
-  const res = await fetch(target, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": client.userAgent,
-      "X-YouTube-Client-Name": client.clientId,
-      "X-YouTube-Client-Version": client.clientVersion,
-      Origin: "https://www.youtube.com",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    body,
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": client.userAgent,
+    "X-YouTube-Client-Name": client.clientId,
+    "X-YouTube-Client-Version": client.clientVersion,
+    Origin: "https://www.youtube.com",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+
+  // Note: X-Forwarded-For was tried here to make YouTube mint the URL against
+  // the Worker's IPv6 egress. YouTube ignores it — the signed `ip` came back
+  // unchanged — so it was removed rather than left as cargo cult.
+  const res = await fetch(target, { method: "POST", headers, body });
 
   if (!res.ok) {
     throw new ExtractionError(
@@ -248,16 +275,69 @@ function hasUsableStreams(pr: PlayerResponse): boolean {
  * Throws an ExtractionError carrying YouTube's own reason when all fail, so the
  * UI can show something better than "something went wrong".
  */
+/**
+ * A transport failure (429, 5xx) is not a verdict about the client — it is
+ * usually YouTube throttling this server for a moment. Falling straight through
+ * to the next client turns a temporary rate-limit into a permanent-looking
+ * "bot check", because the fallback clients genuinely are bot-checked. So the
+ * same client is retried briefly before moving on.
+ */
+async function callPlayerWithRetry(
+  client: ClientProfile,
+  videoId: string,
+  env: { YT_PROXY_URL?: string },
+  attempts = 3,
+): Promise<PlayerResponse> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await callPlayer(client, videoId, env);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 export async function fetchPlayer(
   videoId: string,
   env: { YT_PROXY_URL?: string },
+  opts?: { fresh?: boolean },
 ): Promise<{ player: PlayerResponse; client: string }> {
+  // Short-lived cache for metadata. The watch page and /api/info would
+  // otherwise each hit YouTube, which is what invites the throttling.
+  //
+  // Downloads must pass fresh:true. googlevideo bakes the requesting IP into
+  // the URL it hands back, so a URL minted during one request and fetched
+  // during another is answered with 403 — the stream has to be minted by the
+  // same request that goes on to read it.
+  const cacheKey = new Request(`https://player.sagetube.internal/${videoId}`);
+  const cache = caches.default;
+  if (!opts?.fresh) {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) {
+        const cached = (await hit.json()) as {
+          player: PlayerResponse;
+          client: string;
+        };
+        if (cached?.player) return cached;
+      }
+    } catch {
+      // A cache miss or parse failure just means we fetch it fresh.
+    }
+  }
+
   const failures: string[] = [];
+  let transportOnly = true;
 
   for (const client of CLIENTS) {
     let pr: PlayerResponse;
     try {
-      pr = await callPlayer(client, videoId, env);
+      pr = await callPlayerWithRetry(client, videoId, env);
     } catch (err) {
       failures.push(`${client.name}: ${(err as Error).message}`);
       continue;
@@ -265,8 +345,26 @@ export async function fetchPlayer(
 
     const status = pr.playabilityStatus?.status ?? "UNKNOWN";
     if (status === "OK" && hasUsableStreams(pr)) {
-      return { player: pr, client: client.name };
+      const result = { player: pr, client: client.name };
+      try {
+        await cache.put(
+          cacheKey,
+          new Response(JSON.stringify(result), {
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "max-age=240",
+            },
+          }),
+        );
+      } catch {
+        // Caching is an optimisation; failing to store must not fail the call.
+      }
+      return result;
     }
+
+    // A real answer from YouTube, so the run is no longer purely transport
+    // failures — the message below can speak about the video, not throttling.
+    transportOnly = false;
 
     const reason =
       pr.playabilityStatus?.reason ??
@@ -282,14 +380,26 @@ export async function fetchPlayer(
   }
 
   const joined = failures.join(" | ");
-  if (/sign in|bot|confirm you/i.test(joined)) {
+
+  // Every client failed at the transport layer: throttling, not a bot verdict.
+  // Saying "blocked" here sent people chasing the wrong problem.
+  if (transportOnly) {
     throw new ExtractionError(
-      "YouTube is blocking this server for this video. It checks whether " +
-        "requests come from a real device, and rejects most traffic from " +
-        "cloud hosting like Cloudflare. Other videos may still work.",
+      "YouTube is rate-limiting this server right now. Wait a few seconds and try again.",
+      503,
+      joined,
+    );
+  }
+
+  // The primary client only ever reports a bot check when it is genuinely
+  // gated; the fallbacks report it constantly, so they must not decide this.
+  if (/sign in|bot|confirm you/i.test(failures[0] ?? "")) {
+    throw new ExtractionError(
+      "YouTube wants a signed-in session for this particular video, so it " +
+        "cannot be fetched. Most other videos still work.",
       429,
       joined,
     );
   }
-  throw new ExtractionError("No playable streams found.", 502, joined);
+  throw new ExtractionError("No playable streams found for this video.", 502, joined);
 }

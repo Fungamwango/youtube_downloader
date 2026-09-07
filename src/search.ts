@@ -169,6 +169,37 @@ function parseResults(data: unknown, limit: number, excludeLive?: boolean): Feed
   return items;
 }
 
+export interface SearchResult {
+  items: FeedItem[];
+  /** Opaque token that fetches the next page. Absent when there is no more. */
+  continuation?: string;
+}
+
+/**
+ * Pulls the "load more" token out of a response. Like the result cards, it sits
+ * at a path that InnerTube reshuffles, so it is located by walking the tree
+ * rather than by a fixed path.
+ */
+function findContinuation(node: unknown, depth = 0): string | undefined {
+  if (depth > 30 || !node) return undefined;
+  if (Array.isArray(node)) {
+    for (const v of node) {
+      const t = findContinuation(v, depth + 1);
+      if (t) return t;
+    }
+    return undefined;
+  }
+  if (typeof node !== "object") return undefined;
+  const n = node as AnyObj;
+  const cc = n.continuationCommand as AnyObj | undefined;
+  if (cc && typeof cc.token === "string") return cc.token;
+  for (const v of Object.values(n)) {
+    const t = findContinuation(v, depth + 1);
+    if (t) return t;
+  }
+  return undefined;
+}
+
 /**
  * YouTube intermittently answers searches from Cloudflare's ranges with a
  * well-formed but result-free payload — a soft bot check rather than an error,
@@ -176,25 +207,59 @@ function parseResults(data: unknown, limit: number, excludeLive?: boolean): Feed
  * the same query succeeds on an immediate retry, so retrying is what makes the
  * feed dependable.
  */
-export async function search(
+export async function searchFull(
   query: string,
   env: { YT_PROXY_URL?: string },
   limit = 30,
   opts?: { excludeLive?: boolean },
-): Promise<FeedItem[]> {
+): Promise<SearchResult> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const data = await innertube("search", { query, params: FILTER_VIDEOS_ONLY }, env);
       const items = parseResults(data, limit, opts?.excludeLive);
-      if (items.length) return items;
+      if (items.length) {
+        return { items, continuation: findContinuation(data) };
+      }
     } catch (err) {
       lastErr = err;
     }
     if (attempt < 2) await new Promise((r) => setTimeout(r, 120 * (attempt + 1)));
   }
   if (lastErr) throw lastErr;
-  return [];
+  return { items: [] };
+}
+
+/** Fetches the next page for a token returned by searchFull/continueSearch. */
+export async function continueSearch(
+  token: string,
+  env: { YT_PROXY_URL?: string },
+  limit = 30,
+  opts?: { excludeLive?: boolean },
+): Promise<SearchResult> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const data = await innertube("search", { continuation: token }, env);
+      const items = parseResults(data, limit, opts?.excludeLive);
+      if (items.length) {
+        return { items, continuation: findContinuation(data) };
+      }
+    } catch {
+      // fall through to the retry
+    }
+    if (attempt < 1) await new Promise((r) => setTimeout(r, 150));
+  }
+  return { items: [] };
+}
+
+/** Items-only convenience wrapper for callers that do not paginate. */
+export async function search(
+  query: string,
+  env: { YT_PROXY_URL?: string },
+  limit = 30,
+  opts?: { excludeLive?: boolean },
+): Promise<FeedItem[]> {
+  return (await searchFull(query, env, limit, opts)).items;
 }
 
 /**
@@ -202,56 +267,162 @@ export async function search(
  * requests, so each "category" is a curated search instead — same grid, and it
  * keeps working when the browse surface changes.
  */
-export const CATEGORIES: { id: string; label: string; query: string }[] = [
+/**
+ * Each category holds several queries rather than one. A single fixed query
+ * returns the same ranked list every time, which made the home page look
+ * frozen; rotating the query and shuffling the results gives the changing feed
+ * people expect from a browse page.
+ */
+export const CATEGORIES: { id: string; label: string; queries: string[] }[] = [
   // Queries lean towards produced, finished uploads. Broad terms like "news"
   // or "gaming" return mostly 24/7 live channels, which are filtered out and
   // would otherwise leave the grid nearly empty.
-  { id: "trending", label: "Trending", query: "most viewed videos this week" },
-  { id: "music", label: "Music", query: "official music video 2026" },
-  { id: "gaming", label: "Gaming", query: "gameplay walkthrough 2026" },
-  { id: "movies", label: "Movies", query: "official movie trailer 2026" },
-  { id: "news", label: "News", query: "news recap this week" },
-  { id: "sports", label: "Sports", query: "match highlights 2026" },
-  { id: "learning", label: "Learning", query: "documentary explained" },
-  { id: "podcasts", label: "Podcasts", query: "podcast full episode" },
+  {
+    id: "trending",
+    label: "Trending",
+    queries: [
+      "most viewed videos this week",
+      "trending videos 2026",
+      "viral video this month",
+      "popular videos right now",
+      "best videos this week",
+    ],
+  },
+  {
+    id: "music",
+    label: "Music",
+    queries: [
+      "official music video 2026",
+      "new songs 2026",
+      "top hits this month",
+      "official audio new release",
+      "live performance 2026",
+    ],
+  },
+  {
+    id: "gaming",
+    label: "Gaming",
+    queries: [
+      "gameplay walkthrough 2026",
+      "gaming moments compilation",
+      "new game review 2026",
+      "speedrun world record",
+      "best gaming clips",
+    ],
+  },
+  {
+    id: "movies",
+    label: "Movies",
+    queries: [
+      "official movie trailer 2026",
+      "new film trailer",
+      "movie clips scenes",
+      "behind the scenes film",
+      "short film award winning",
+    ],
+  },
+  {
+    id: "news",
+    label: "News",
+    queries: [
+      "news recap this week",
+      "world news explained",
+      "top stories this month",
+      "news analysis 2026",
+      "weekly news roundup",
+    ],
+  },
+  {
+    id: "sports",
+    label: "Sports",
+    queries: [
+      "match highlights 2026",
+      "best goals compilation",
+      "sports top plays",
+      "championship highlights",
+      "greatest moments sport",
+    ],
+  },
+  {
+    id: "learning",
+    label: "Learning",
+    queries: [
+      "documentary explained",
+      "how it works explained",
+      "science documentary 2026",
+      "history documentary",
+      "tutorial for beginners",
+    ],
+  },
+  {
+    id: "podcasts",
+    label: "Podcasts",
+    queries: [
+      "podcast full episode",
+      "interview podcast 2026",
+      "best podcast moments",
+      "long form interview",
+      "podcast highlights",
+    ],
+  },
 ];
 
+function shuffle<T>(arr: T[]): T[] {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 /**
- * Category feed, with a last-known-good fallback.
+ * Category feed: a random query from the category, results shuffled, and a
+ * continuation token so the grid can keep loading as the visitor scrolls.
  *
  * Even with retries a search can come back empty, and an empty home page looks
- * broken. Successful feeds are stashed in the edge cache and replayed when a
- * later fetch yields nothing, so visitors always see a populated grid.
+ * broken, so successful feeds are stashed in the edge cache and replayed when a
+ * later fetch yields nothing.
  */
 export async function feed(
   categoryId: string,
   env: { YT_PROXY_URL?: string },
-): Promise<FeedItem[]> {
+): Promise<SearchResult> {
   const cat = CATEGORIES.find((c) => c.id === categoryId) ?? CATEGORIES[0];
   const cacheKey = new Request(`https://feed.sagetube.internal/${cat.id}`);
   const cache = caches.default;
+  const query = cat.queries[Math.floor(Math.random() * cat.queries.length)];
 
-  let items: FeedItem[] = [];
+  let result: SearchResult = { items: [] };
   try {
-    items = await search(cat.query, env, 30, { excludeLive: true });
+    result = await searchFull(query, env, 30, { excludeLive: true });
   } catch {
-    items = [];
+    result = { items: [] };
   }
 
-  if (items.length) {
-    await cache.put(
-      cacheKey,
-      new Response(JSON.stringify(items), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "max-age=1800",
-        },
-      }),
-    );
-    return items;
+  if (result.items.length) {
+    const out = { items: shuffle(result.items), continuation: result.continuation };
+    try {
+      await cache.put(
+        cacheKey,
+        new Response(JSON.stringify(out), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "max-age=1800",
+          },
+        }),
+      );
+    } catch {
+      // Caching is best-effort.
+    }
+    return out;
   }
 
   const stale = await cache.match(cacheKey);
-  if (stale) return (await stale.json()) as FeedItem[];
-  return [];
+  if (stale) {
+    const cached = (await stale.json()) as SearchResult;
+    // Reshuffle the fallback too, so a stale feed still looks alive.
+    return { items: shuffle(cached.items ?? []), continuation: cached.continuation };
+  }
+  return { items: [] };
 }
