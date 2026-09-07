@@ -1,0 +1,29 @@
+# Render Blueprint for the SageTube relay.
+#
+# Render's free tier needs no credit card, which is why it is the recommended
+# always-on home for the relay. Deploy: push this repo to GitHub, then in
+# Render choose "New > Blueprint" and point it at the repo.
+#
+# After it deploys, set both Worker secrets to:
+#   https://<service>.onrender.com/fetch?token=<TOKEN>&url={url}
+#
+# Note: the free plan sleeps after ~15 minutes idle, so the first download
+# after a quiet spell waits for a cold start. Any paid tier removes that.
+services:
+  - type: web
+    name: sagetube-relay
+    runtime: docker
+    plan: free
+    rootDir: relay
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      # Set this yourself in the Render dashboard, then use the same value in
+      # the Worker secrets. sync:false keeps it out of the repo.
+      - key: TOKEN
+        sync: false
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8080

@@ -18,18 +18,18 @@
     "enabled": true
   },
 
-  "vars": {
-    // Optional relay for InnerTube (metadata) calls. Two shapes work:
-    //   "https://relay.example.com/fetch?url={url}"  - template style
-    //   "https://relay.example.com"                  - mirrors youtube.com paths
-    // Empty = call YouTube directly from the Worker.
-    "YT_PROXY_URL": "",
-
-    // Optional relay for googlevideo (media) requests. googlevideo signs the
-    // minting IP into the stream URL, so downloads only succeed when the media
-    // fetch leaves from the same address that minted it — this must therefore
-    // point at the SAME machine as YT_PROXY_URL. Only the {url} template shape
-    // works here. Defaults to YT_PROXY_URL when that is a {url} template.
-    "YT_MEDIA_PROXY_URL": ""
-  }
+  // YT_PROXY_URL and YT_MEDIA_PROXY_URL are deliberately NOT declared here.
+  // They carry the relay's auth token, so they are set as secrets:
+  //
+  //   npx wrangler secret put YT_PROXY_URL
+  //   npx wrangler secret put YT_MEDIA_PROXY_URL
+  //   value: https://<relay-host>/fetch?token=<secret>&url={url}
+  //
+  // Declaring them as plain vars here would also block the secret, since a
+  // secret cannot share a name with an existing var binding.
+  //
+  // Both must point at the SAME machine: googlevideo signs the minting IP into
+  // the stream URL, so the media fetch has to leave from the address that
+  // minted it. Unset = call YouTube directly (downloads then fail for most
+  // videos; see README).
 }
