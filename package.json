@@ -1,0 +1,16 @@
+{
+  "name": "grabtube",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VidMate-style YouTube downloader running entirely on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260903.1",
+    "typescript": "^5.6.3",
+    "wrangler": "^4.0.0"
+  }
+}

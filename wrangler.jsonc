@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "grabtube",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+
+  // ./public holds only styles.css and app.js. There is deliberately no
+  // index.html: every HTML page is server-rendered by the Worker so crawlers
+  // get real markup, so unmatched paths must fall through instead of being
+  // answered by the asset layer.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "none"
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  "vars": {
+    // Optional: base URL of an HTTP proxy that YouTube trusts more than
+    // Cloudflare's datacenter ranges. Empty = call YouTube directly.
+    "YT_PROXY_URL": ""
+  }
+}
