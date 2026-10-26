@@ -50,46 +50,63 @@ export async function streamFormat(
   request: Request,
   env: { YT_PROXY_URL?: string; YT_MEDIA_PROXY_URL?: string },
 ): Promise<Response> {
-  // fresh:true is required — see fetchPlayer. A cached player response carries
-  // URLs minted for a different request's IP, which googlevideo answers with 403.
-  const { player, client } = await fetchPlayer(opts.videoId, env, { fresh: true });
-  const fmt = findFormatUrl(player, opts.itag);
-  if (!fmt?.url) {
-    throw new ExtractionError(
-      "That quality is no longer offered for this video.",
-      404,
-    );
+  const range = request.headers.get("Range");
+
+  /**
+   * Mint a URL and immediately fetch it.
+   *
+   * googlevideo signs the minting IP into the URL (`ip` is in its `sparams`),
+   * and Cloudflare does not guarantee the same egress address for the InnerTube
+   * call and the media call. When they differ the media host answers 403.
+   *
+   * That mismatch is a per-request race, not a fixed property of a video:
+   * measured at roughly 10 successes in 12 attempts, with the same video both
+   * succeeding and failing minutes apart. So a refusal is retried with a
+   * completely fresh mint, which is what turns an intermittent failure into a
+   * reliable download. Each attempt must re-mint — reusing the previous URL
+   * would just reproduce the same mismatch.
+   */
+  const attempt = async () => {
+    // fresh:true is required — a cached player response carries URLs minted for
+    // a different request's IP, which googlevideo answers with 403.
+    const { player, client } = await fetchPlayer(opts.videoId, env, { fresh: true });
+    const fmt = findFormatUrl(player, opts.itag);
+    if (!fmt?.url) {
+      throw new ExtractionError("That quality is no longer offered for this video.", 404);
+    }
+
+    // googlevideo also checks that the caller looks like the client the URL was
+    // minted for, and that client varies per request, so the UA is looked up
+    // rather than hardcoded.
+    const profile = CLIENTS.find((c) => c.name === client);
+    const upstreamHeaders: Record<string, string> = {
+      "User-Agent": profile?.userAgent ?? CLIENTS[0].userAgent,
+      "Accept-Language": "en-US,en;q=0.9",
+    };
+    // Forward Range verbatim so browsers can resume and seek.
+    if (range) upstreamHeaders.Range = range;
+
+    const res = await fetch(viaProxy(fmt.url, mediaProxyBase(env)), {
+      headers: upstreamHeaders,
+    });
+    return { res, fmt, player, client };
+  };
+
+  let current = await attempt();
+  for (let i = 0; i < 2 && !current.res.ok && current.res.status !== 206; i++) {
+    // Drain the refusal so the connection is not left dangling.
+    await current.res.body?.cancel().catch(() => {});
+    await new Promise((r) => setTimeout(r, 150 * (i + 1)));
+    current = await attempt();
   }
 
-  const mime = (fmt.mimeType ?? "").split(";")[0] || "application/octet-stream";
-  const sub = mime.split("/")[1] ?? "mp4";
-  const ext = mime.startsWith("audio/") && sub === "mp4" ? "m4a" : sub;
-  const title = opts.filename ?? player.videoDetails?.title ?? opts.videoId;
+  const { res: upstream, fmt, player, client } = current;
 
-  // Forward Range verbatim so browsers can resume and seek. googlevideo
-  // honours it; without it, large downloads cannot be resumed.
-  // googlevideo checks that the caller looks like the client the URL was minted
-  // for. The client varies per request (IOS or ANDROID_VR, whichever answers
-  // first), so the UA has to be looked up rather than hardcoded — a fixed UA
-  // gets a refusal whenever the other client happens to mint the URL.
-  const profile = CLIENTS.find((c) => c.name === client);
-  const upstreamHeaders: Record<string, string> = {
-    "User-Agent": profile?.userAgent ?? CLIENTS[0].userAgent,
-    "Accept-Language": "en-US,en;q=0.9",
-  };
-  const range = request.headers.get("Range");
-  if (range) upstreamHeaders.Range = range;
-
-  const upstream = await fetch(viaProxy(fmt.url, mediaProxyBase(env)), {
-    headers: upstreamHeaders,
-  });
   if (!upstream.ok && upstream.status !== 206) {
-    // googlevideo signs the minting IP into the URL (it appears in `sparams`),
-    // so a 403 usually means the egress IP moved between minting the URL and
-    // fetching it. Report both so that is visible rather than guessed at.
-    let diagnostic = `HTTP ${upstream.status}`;
+    // Report both addresses, so an IP mismatch is visible rather than guessed.
+    let diagnostic = `HTTP ${upstream.status} after 3 attempts`;
     try {
-      const signedIp = new URL(fmt.url).searchParams.get("ip") ?? "?";
+      const signedIp = new URL(fmt.url!).searchParams.get("ip") ?? "?";
       const egress = await fetch("https://api.ipify.org?format=json")
         .then((r) => r.json() as Promise<{ ip?: string }>)
         .then((j) => j.ip ?? "?")
@@ -100,6 +117,11 @@ export async function streamFormat(
     }
     throw new ExtractionError("The media host refused the download.", 502, diagnostic);
   }
+
+  const mime = (fmt.mimeType ?? "").split(";")[0] || "application/octet-stream";
+  const sub = mime.split("/")[1] ?? "mp4";
+  const ext = mime.startsWith("audio/") && sub === "mp4" ? "m4a" : sub;
+  const title = opts.filename ?? player.videoDetails?.title ?? opts.videoId;
 
   const headers = new Headers();
   headers.set("Content-Type", mime);

@@ -391,12 +391,16 @@ export async function fetchPlayer(
     );
   }
 
-  // The primary client only ever reports a bot check when it is genuinely
-  // gated; the fallbacks report it constantly, so they must not decide this.
+  // When the primary client is bot-checked, it is almost never about the video:
+  // the same request succeeds from a residential IP. It means YouTube is
+  // refusing this server's address, which hits most videos at once. An earlier
+  // message blamed "this particular video", which sent people hunting for a
+  // video that would work instead of reporting an outage.
   if (/sign in|bot|confirm you/i.test(failures[0] ?? "")) {
     throw new ExtractionError(
-      "YouTube wants a signed-in session for this particular video, so it " +
-        "cannot be fetched. Most other videos still work.",
+      "YouTube is refusing requests from our server right now, so this video " +
+        "can't be fetched. This usually affects most videos, not just this one — " +
+        "please try again later.",
       429,
       joined,
     );
